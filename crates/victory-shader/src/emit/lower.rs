@@ -5525,7 +5525,7 @@ impl<'a> Lower<'a> {
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let is_buffer = self.s.m.cmp(self.cur, pred::SGT, stride, zero);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -5548,7 +5548,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::SLT, stride, zero);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6265,7 +6265,22 @@ impl<'a> Lower<'a> {
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
-                let index = self.heap_index(*load, *first, sampler)?;
+                let mut index = self.heap_index(*load, *first, sampler)?;
+                // A buffer picked by a computed index: a slot that holds a
+                // texture or no view is read as a null one. AMD faults on
+                // a texture's descriptor read as a buffer's.
+                let null = super::shader::view_heap_limit();
+                if !sampler
+                    && null != 0
+                    && matches!(props.0 & 0xff, 10..=13)
+                    && let Some(stride) = self.slot_stride(src)?
+                {
+                    let zero = self.s.m.i32(0);
+                    let p = if props.0 & 0xff == 13 { pred::SLT } else { pred::SGT };
+                    let fits = self.s.m.cmp(self.cur, p, stride, zero);
+                    let null = self.s.m.i32(null);
+                    index = self.s.m.select(self.cur, fits, index, null);
+                }
                 // A waterfall loop's load at the first lane's offset reads
                 // each lane's own entry (see `resource::Waterfall`).
                 let per_lane = self.x.res.waterfall.loads.contains(load);
