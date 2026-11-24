@@ -59,9 +59,27 @@ impl Pending {
         }
     }
 
+    fn bytes(&self) -> usize {
+        self.shaders.iter().map(|s| s.container.len()).sum()
+    }
+
+    /// `VICTORY_MAX_COMPUTE_KB=<n>`: compute programs whose console container
+    /// is larger are left out. Grand Theft Auto VI's ray-tracing resolve
+    /// programs (50 to 80 KB, some 260 in the first scene) take AMD's
+    /// compiler 9 s and gigabytes each, and light nothing without the
+    /// ray-tracing structures.
+    fn too_big(&self) -> bool {
+        static MAX: OnceLock<usize> = OnceLock::new();
+        let max = *MAX.get_or_init(|| {
+            let kb = std::env::var("VICTORY_MAX_COMPUTE_KB").ok().and_then(|v| v.trim().parse::<usize>().ok());
+            kb.map_or(usize::MAX, |kb| kb << 10)
+        });
+        self.graphics.is_none() && self.bytes() > max
+    }
+
     fn make(&self) {
         self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+            .get_or_init(|| if self.too_big() { None } else { HostPipeline::new(&self.shaders, self.graphics.as_deref()) });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -249,7 +267,9 @@ impl Queue {
     }
 
     fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+        // The smallest first: a few big ones do not hold up the rest.
+        let smallest = (0..self.requested.len()).min_by_key(|&i| self.requested[i].bytes());
+        let p = smallest.and_then(|i| self.requested.remove(i)).or_else(|| {
             // An early entry can have been promoted and claimed already.
             std::iter::from_fn(|| self.early.pop_front())
                 .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
