@@ -599,42 +599,117 @@ pub fn writing(at: usize, len: usize) {
 /// had asked whether the texture was all mapped and been told yes. Asking
 /// cannot help; not changing the mapping while such a read is under way
 /// does.
-static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
-
-/// What the runtime holds while it changes what title memory shows
-/// ([`title_memory_remapping`]).
-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>);
-
-/// The runtime is about to map, unmap or move physical pages of title
-/// memory: until what it returns is dropped, no read of title memory in
-/// place is under way and none begins ([`title_memory_reading`]). Taken
-/// around the whole change, the unmapping and the mapping again.
-pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+// A missing range is global, including overflow and unknown extents.
+type MappingRange = Option<(usize, usize)>;
+fn mapping_range(at: usize, len: usize) -> MappingRange {
+    if len == 0 { return None; }
+    at.checked_add(len).map(|end| (at, end))
 }
-
-/// What a read of title memory in place holds ([`title_memory_reading`]).
-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
-
-/// For reading title memory in place: until what it returns is dropped,
-/// the runtime changes no mapping, so memory found mapped stays mapped.
-/// Not to be taken twice by one thread, nor held across anything that
-/// maps title memory.
-pub fn title_memory_reading() -> Reading {
-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// [`title_memory_reading`] if it can be had at once: `None` while the
-/// runtime changes a mapping (or waits to), for a caller that has another
-/// way to read and would rather not wait.
-pub fn title_memory_reading_now() -> Option<Reading> {
-    match MAPPING.try_read() {
-        Ok(guard) => Some(Reading(guard)),
-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
-        Err(std::sync::TryLockError::WouldBlock) => None,
+fn mapping_overlaps(a: MappingRange, b: MappingRange) -> bool {
+    match (a, b) {
+        (Some((a, b)), Some((c, d))) => a < d && c < b,
+        _ => true,
     }
 }
+#[derive(Default)]
+struct MappingState {
+    next: u64,
+    readers: Vec<(u64, MappingRange)>,
+    // Pending and active writers share one ordered queue. New readers wait
+    // behind an overlapping queued writer to prevent writer starvation.
+    writers: Vec<(u64, MappingRange, bool)>,
+}
+static MAPPING: std::sync::Mutex<MappingState> = std::sync::Mutex::new(MappingState {
+    next: 0, readers: Vec::new(), writers: Vec::new(),
+});
+static MAPPING_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+fn mapping_state() -> std::sync::MutexGuard<'static, MappingState> {
+    MAPPING.lock().unwrap_or_else(|e| e.into_inner())
+}
+fn mapping_id(state: &mut MappingState) -> u64 {
+    let id = state.next;
+    state.next = id.checked_add(1).expect("mapping guard identifiers exhausted");
+    id
+}
 
+/// Guard for a mapping change. Dropping it wakes overlapping waiters.
+pub struct Remapping(u64);
+impl Drop for Remapping {
+    fn drop(&mut self) {
+        let mut state = mapping_state();
+        state.writers.retain(|writer| writer.0 != self.0);
+        MAPPING_MOVED.notify_all();
+    }
+}
+fn mapping_write(range: MappingRange) -> Remapping {
+    let mut state = mapping_state();
+    let id = mapping_id(&mut state);
+    state.writers.push((id, range, false));
+    loop {
+        let busy_readers = state.readers.iter().any(|&(_, other)| mapping_overlaps(range, other));
+        let busy_writers = state.writers.iter().any(|&(other_id, other, active)| {
+            other_id != id && (active || other_id < id) && mapping_overlaps(range, other)
+        });
+        if !busy_readers && !busy_writers { break; }
+        state = MAPPING_MOVED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    state.writers.iter_mut().find(|writer| writer.0 == id).unwrap().2 = true;
+    Remapping(id)
+}
+/// Excludes all in-place readers during a mapping change of unknown extent.
+pub fn title_memory_remapping() -> Remapping { mapping_write(None) }
+/// Excludes readers overlapping the full range affected by a mapping change.
+pub fn title_memory_remapping_range(at: usize, len: usize) -> Remapping {
+    mapping_write(mapping_range(at, len))
+}
+
+/// Guard for an in-place title-memory read.
+pub struct Reading(u64);
+impl Drop for Reading {
+    fn drop(&mut self) {
+        let mut state = mapping_state();
+        state.readers.retain(|reader| reader.0 != self.0);
+        if !state.writers.is_empty() {
+            MAPPING_MOVED.notify_all();
+        }
+    }
+}
+fn mapping_read(range: MappingRange, wait: bool) -> Option<Reading> {
+    let mut state = if wait {
+        mapping_state()
+    } else {
+        match MAPPING.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        }
+    };
+    while state.writers.iter().any(|&(_, other, _)| mapping_overlaps(range, other)) {
+        if !wait { return None; }
+        state = MAPPING_MOVED.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    let id = mapping_id(&mut state);
+    state.readers.push((id, range));
+    Some(Reading(id))
+}
+/// Global read, for callers whose read extent is not known. Do not acquire
+/// a second read or map title memory while a read guard is held.
+pub fn title_memory_reading() -> Reading { mapping_read(None, true).unwrap() }
+/// Nonblocking global read.
+pub fn title_memory_reading_now() -> Option<Reading> { mapping_read(None, false) }
+/// Read only the given range; overflow falls back to global exclusion.
+pub fn title_memory_reading_range(at: usize, len: usize) -> Reading {
+    mapping_read(mapping_range(at, len), true).unwrap()
+}
+/// Nonblocking version of the range read.
+pub fn title_memory_reading_range_now(at: usize, len: usize) -> Option<Reading> {
+    mapping_read(mapping_range(at, len), false)
+}
+#[cfg(test)]
+fn mapping_writer_pending_for_test(at: usize, len: usize) -> bool {
+    let range = mapping_range(at, len);
+    mapping_state().writers.iter().any(|&(_, other, active)| !active && mapping_overlaps(range, other))
+}
 /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
@@ -1063,11 +1138,53 @@ mod mapping_tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
     use std::time::Duration;
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn disjoint_reader_can_run_while_a_range_is_remapped() {
+        let _serial = SERIAL.lock().unwrap();
+        let _writer = super::title_memory_remapping_range(0x10000, 0x1000);
+        assert!(super::title_memory_reading_range_now(0x20000, 0x1000).is_some());
+        assert!(super::title_memory_reading_range_now(0x10800, 1).is_none());
+        assert!(super::title_memory_reading_now().is_none());
+        assert!(super::title_memory_reading_range_now(usize::MAX, 2).is_none());
+    }
+
+    #[test]
+    fn nonblocking_read_does_not_wait_for_registry_mutex() {
+        let _serial = SERIAL.lock().unwrap();
+        let _registry = super::mapping_state();
+        assert!(super::title_memory_reading_range_now(0x20000, 0x1000).is_none());
+        assert!(super::title_memory_reading_now().is_none());
+    }
+
+    #[test]
+    fn waiting_overlapping_writer_prevents_new_readers() {
+        let _serial = SERIAL.lock().unwrap();
+        let reader = super::title_memory_reading_range(0x30000, 0x1000);
+        let (started, wait) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            let _writer = super::title_memory_remapping_range(0x30000, 0x1000);
+        });
+        wait.recv().unwrap();
+        // Wait for the writer to register, rather than relying on scheduling.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !super::mapping_writer_pending_for_test(0x30000, 0x1000) {
+            assert!(std::time::Instant::now() < deadline, "writer failed to register");
+            std::thread::yield_now();
+        }
+        assert!(super::title_memory_reading_range_now(0x30000, 1).is_none());
+        assert!(super::title_memory_reading_range_now(0x40000, 1).is_some());
+        drop(reader);
+        thread.join().unwrap();
+    }
 
     /// A change of mapping waits for a read in place that is under way, and
     /// a read in place waits for a change of mapping.
     #[test]
     fn reads_in_place_and_remappings_wait_for_each_other() {
+        let _serial = SERIAL.lock().unwrap();
         // A reader holds; the change does not begin until it lets go.
         let changed = Arc::new(AtomicBool::new(false));
         let reading = title_memory_reading();
