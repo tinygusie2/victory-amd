@@ -79,7 +79,12 @@ impl Pending {
 
     fn make(&self) {
         self.made
-            .get_or_init(|| if self.too_big() { None } else { HostPipeline::new(&self.shaders, self.graphics.as_deref()) });
+            .get_or_init(|| {
+            if self.too_big() || self.shaders.iter().any(|s| crashers::skipped(&s.hash)) {
+                return None;
+            }
+            crashers::watched(&self.shaders, || HostPipeline::new(&self.shaders, self.graphics.as_deref()))
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
@@ -416,5 +421,90 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), None);
         assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
         assert!(queue.pop().is_none());
+    }
+}
+
+/// Shaders that crash the host driver's compiler (AMD: a read of address 8
+/// in `amdxc64.dll`) end the process. Their hashes are noted as the fault
+/// is raised, and their pipelines left out from the next run on.
+mod crashers {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    use std::sync::{Arc, OnceLock};
+
+    use super::super::Shader;
+
+    thread_local! {
+        static MAKING: RefCell<Option<(String, bool)>> = const { RefCell::new(None) };
+    }
+
+    fn dir() -> Option<PathBuf> {
+        super::super::library::dir().map(|d| d.join("crashed"))
+    }
+
+    /// `VICTORY_SKIP_PIPELINES`, or noted by an earlier run.
+    pub(super) fn skipped(hash: &str) -> bool {
+        static HASHES: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+        HASHES
+            .get_or_init(|| {
+                let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+                let mut all: std::collections::HashSet<String> =
+                    value.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| h.len() == 16).collect();
+                let noted = dir().and_then(|d| std::fs::read_dir(d).ok());
+                for e in noted.into_iter().flatten().flatten() {
+                    // A pipeline of several shaders: any one of them may be
+                    // good elsewhere, so only single-shader ones are skipped.
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    if name.len() == 16 {
+                        tracing::warn!(hash = %name, "left out: it crashed the host's compiler in an earlier run");
+                        all.insert(name);
+                    }
+                }
+                all
+            })
+            .contains(hash)
+    }
+
+    unsafe extern "system" fn note(info: *const *const u32) -> i32 {
+        // SAFETY: the system passes valid exception pointers; the record's
+        // first dword is the code.
+        if unsafe { **info } == 0xC000_0005 {
+            MAKING.with(|m| {
+                if let Ok(mut m) = m.try_borrow_mut()
+                    && let Some((name, raised)) = m.as_mut()
+                    && !*raised
+                {
+                    *raised = true;
+                    if let Some(d) = dir() {
+                        let _ = std::fs::create_dir_all(&d);
+                        let _ = std::fs::write(d.join(&*name), b"");
+                    }
+                }
+            });
+        }
+        0
+    }
+
+    #[link(name = "kernel32", kind = "raw-dylib")]
+    unsafe extern "system" {
+        fn AddVectoredExceptionHandler(first: u32, handler: unsafe extern "system" fn(*const *const u32) -> i32) -> *mut core::ffi::c_void;
+    }
+
+    pub(super) fn watched<T>(shaders: &[Arc<Shader>], make: impl FnOnce() -> T) -> T {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: the handler only notes and lets the search go on.
+        ONCE.call_once(|| unsafe {
+            AddVectoredExceptionHandler(0, note);
+        });
+        let name = shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>().join("-");
+        MAKING.with(|m| *m.borrow_mut() = Some((name, false)));
+        let out = make();
+        // It came through: a fault on the way was handled by its owner.
+        if let Some((name, true)) = MAKING.with(|m| m.borrow_mut().take())
+            && let Some(d) = dir()
+        {
+            let _ = std::fs::remove_file(d.join(name));
+        }
+        out
     }
 }
