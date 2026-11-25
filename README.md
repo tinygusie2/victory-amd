@@ -30,7 +30,8 @@ developer or publisher.
 
 ## Status of this fork (2026-11-25)
 
-**Not playable yet: 2.5 to 4 frames per second, and shadowed areas are black.**
+**Not playable yet: about 8 to 10 frames per second in the first rooms and 5 to 8.5 in the
+opening cutscene (the console runs 30), and shadowed areas are black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -41,7 +42,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Saves | the game autosaves a checkpoint and loads it again |
 | First gameplay scene (the prologue) | renders: characters, textures, sky, sunlit exterior; HUD, pause menu and pad input work |
 | Light in shadow | missing: the game's ray-traced bounce light and ray-traced lamp and sun shadows do not run yet, so anything the sun does not hit directly is black |
-| Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
+| Frame rate in the world | 8 to 10 fps in the first rooms: 97 to 104 ms a frame at about 3,850 draws, 122 ms in a heavier view (6,774 draws). 5 to 8.5 fps through the opening cutscene, by stretch (runs 271 to 273, with `VICTORY_CARD_WINDOWS_MB`). All measured with the switch set of run 253, which is off by default: `VICTORY_LEVELS_ON_DEMAND=1 VICTORY_ASYNC_SUBMIT=1 VICTORY_QUEUE2=1 VICTORY_INDIRECT_WINDOW=1 VICTORY_TEXTURE_NO_WAIT=1 VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096 VICTORY_STAGING_POOL=0 VICTORY_COPY_PLAIN=1 VICTORY_JOIN_PARTS=1 VICTORY_BACK_OWN_VIEW=1 VICTORY_INDIRECT_GATHER=1 VICTORY_CARD_REHASH_RUNS=1`. The plain defaults were last measured at 420 to 450 ms a frame and not since. It started at 3 to 6 seconds a frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
 ### Newest (2026-11-25, evening UTC)
