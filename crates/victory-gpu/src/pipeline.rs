@@ -356,6 +356,12 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
+/// Whether the title's pipeline `this` resolves its indirect diffuse light.
+#[cfg(windows)]
+pub(crate) fn resolves_light(this: This) -> bool {
+    !this.is_null() && pipeline(this).resolves_light
+}
+
 /// A stage of the builder was dropped after all: none runs from here on.
 #[cfg(windows)]
 pub(crate) fn builder_off(why: &'static str) {
@@ -443,6 +449,9 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// Its result gives way to the constant light ([`crate::ambient`]).
+    #[cfg(windows)]
+    resolves_light: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -593,6 +602,12 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    let resolves_light = shaders.iter().any(|s| {
+        s.container
+            .windows(crate::ambient::PROGRAM.len())
+            .any(|w| w == crate::ambient::PROGRAM)
+    });
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -608,6 +623,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        resolves_light,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });

@@ -31,6 +31,8 @@ mod fpsbox;
 #[cfg(windows)]
 mod spread;
 #[cfg(windows)]
+mod ambient;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;

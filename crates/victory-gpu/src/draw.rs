@@ -2210,6 +2210,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
+            self.ambient(list, None);
             return;
         }
         // A program that walks ray-tracing structures nothing has built.
@@ -2239,6 +2240,7 @@ impl State {
                 crate::pipeline::note_drop(self.pipeline as This);
                 self.list_dropped_roots([x, y, z]);
             }
+            self.ambient(list, None);
             return;
         };
         if !p.compute {
@@ -2259,6 +2261,41 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        self.ambient(list, Some(p));
+    }
+
+    /// After a dispatch of the program that resolves the indirect diffuse
+    /// light, or in its place if it has no host pipeline (`p`): the
+    /// constant light. From Belobug/VIctory-Belobug-AMD (GPL-3.0).
+    fn ambient(&mut self, list: &HostList, p: Option<&HostPipeline>) {
+        if !crate::pipeline::resolves_light(self.pipeline as This) {
+            return;
+        }
+        let (slot, offset) = crate::ambient::LIGHT;
+        if let Some(stage) = p.and_then(|p| p.stages.first())
+            && !stage.translated().used.iter().any(|u| {
+                u.kind == ResourceType::Uav
+                    && u.root == RootType::Table
+                    && (u.slot, u.table_offset_dwords) == (slot, offset)
+            })
+        {
+            once!("no ambient light: other tables");
+            return;
+        }
+        let Some(Root::Table(table)) = self.roots_ref(true).get(usize::from(slot)) else {
+            once!("no ambient light: no table");
+            return;
+        };
+        let Some(View::Unordered(light, ..)) = crate::descriptor::view(table + u64::from(offset) * 4) else {
+            once!("no ambient light: no view of it");
+            return;
+        };
+        if light != 0 && crate::ambient::raise(list, light as This) {
+            // The list's heaps, root signature and pipeline are the pass's.
+            self.host_heaps = [0; 2];
+            self.host_roots = [0; 2];
+            self.host_pipeline = 0;
+        }
     }
 
     /// What a draw or dispatch runs, for the device-removed report
