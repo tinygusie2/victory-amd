@@ -1104,6 +1104,31 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if compute && crate::waterlook::on() && crate::waterlook::is(&p.name) {
+            let mut views = Vec::new();
+            for u in p.stages.iter().flat_map(|s| s.translated().used.iter()) {
+                let what = format!(
+                    "{} {:?} register {} root {} offset {}",
+                    if u.kind == ResourceType::Uav { "written" } else { "read" },
+                    u.kind,
+                    u.lower_bound,
+                    u.slot,
+                    u.table_offset_dwords
+                );
+                match self.roots_ref(true).get(usize::from(u.slot)) {
+                    Some(Root::Table(table)) if u.root == RootType::Table => {
+                        let view = crate::descriptor::view(table + u64::from(u.table_offset_dwords) * 4);
+                        if let Some((address, bytes)) = view.as_ref().and_then(crate::descriptor::host::buffer_range) {
+                            views.push((address, bytes, what));
+                        }
+                    }
+                    Some(&Root::View(address)) => views.push((address, 4096, what)),
+                    _ => {}
+                }
+            }
+            crate::waterlook::bound(views);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);

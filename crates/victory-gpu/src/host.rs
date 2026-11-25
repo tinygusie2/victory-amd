@@ -6574,6 +6574,10 @@ impl HostList {
 
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
+        #[cfg(feature = "diagnostics")]
+        if crate::waterlook::on() {
+            crate::waterlook::copied(dst as u64, src as u64, len as u64);
+        }
         let mut deferred = self.deferred();
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,

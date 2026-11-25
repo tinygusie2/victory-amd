@@ -26,6 +26,8 @@ pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
 mod drvwatch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod waterlook;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
