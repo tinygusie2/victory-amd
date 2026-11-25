@@ -82,6 +82,14 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
   layer's own refreshes, 3.8 % were written by the title, and 0.19 % were touched by anything
   else, which is the most the title's own code can have read. So nearly all of that copying serves
   nobody: not copying back the buffers nobody reads is the next step there.
+- **Run 279: the set that plays best so far.** The switches of `diagnostics/README.md` plus
+  `VICTORY_CARD_HASH_LEN=1`: the water is right (blue, waves, the sun's path), boats float, and the
+  layer's hash lists are about a quarter cheaper a list. That clears the hash length for the black
+  water of run 277, which leaves the grouped loads below as its cause. `VICTORY_ABSENT_ONCE=alt`
+  ran in it too: with it off the layer asked Windows about 690,000 times in twenty seconds about
+  blocks it already knew to be unmapped; with it on (notes kept 100 ms) 40 to 50 % of the answers
+  came from the notes. No frame gain shown yet at 100 ms: frames there are longer than the notes
+  live.
 - **The grouped scalar loads blackened the water** in run 277 (`VICTORY_SHADER_OPT=127`), and stay
   off. The lead, not proven on the card: one call for four dwords at byte 328 of a 340-byte view
   asks for a dword past its end, where the default form never reads that dword (its call is dead
