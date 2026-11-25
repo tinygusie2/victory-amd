@@ -76,8 +76,24 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
   of the day. The same run then ended with the card lost (the driver logged two errors, then
   "device removed", with nothing of the layer's running on the card at that moment). Why is not
   known; run 275, the same set without this switch, played twenty minutes without an error.
-- **`VICTORY_BACK_READS=1|2|alt`** (diagnostics builds): counts who touches what the copy-back
-  stored (the measuring step before any lazy copy-back). Not run yet.
+- **What the copy-back is worth, measured** (`VICTORY_BACK_READS=alt`, diagnostics builds; run 277,
+  49 minutes of play): 497 GB were copied back from the card into title memory. Of 438,000 stores
+  looked at (one page in 8): 60 % were touched by nothing before the next store, 36 % only by the
+  layer's own refreshes, 3.8 % were written by the title, and 0.19 % were touched by anything
+  else, which is the most the title's own code can have read. So nearly all of that copying serves
+  nobody: not copying back the buffers nobody reads is the next step there.
+- **The grouped scalar loads blackened the water** in run 277 (`VICTORY_SHADER_OPT=127`), and stay
+  off. The lead, not proven on the card: one call for four dwords at byte 328 of a 340-byte view
+  asks for a dword past its end, where the default form never reads that dword (its call is dead
+  code); 90 lighting programs have that load. The software adapter reads the three inside and
+  gives 0 for the one outside; what the card does is not tested.
+- **The card was lost twice**: run 276 after 6 minutes (two driver events, then a hang) and run 277
+  after 49 minutes (device removed with no driver event, 8 ms after a sweep let go 150 texture
+  copies). Causes not known. `diagnostics/` holds a scrubbed log of a short run with
+  `VICTORY_GPU_TIMING=1` and `VICTORY_D3D12_DRED=1` for anyone who wants real numbers.
+- **`VICTORY_ABSENT_ONCE=1|alt`** (off): a block of view memory found unmapped is not asked of
+  Windows again for 100 ms. Outdoors those questions were 44 ms a frame of the submitting thread.
+  Not run in a game yet. `VICTORY_D3D12_DRED=1` costs about 50 ms a frame in a diagnostics build.
 - The texture pass's time budget: never reached in the first rooms (about 5 ms a frame); 15 to
   30 % of the frame in an open-world session. The translator emits no stack slots to promote:
   registers are SSA values already.
