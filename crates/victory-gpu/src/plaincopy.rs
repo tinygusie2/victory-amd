@@ -13,13 +13,13 @@
 //! Here the copy is one `rep movsb` in a function of ours that uses no
 //! stack. An exception handler, first in the line, looks at every access
 //! violation: one that is a READ and happened at exactly that instruction
-//! continues at the function's other exit, which returns 0, and the
+//! continues at the function's exit, which returns the bytes left, and the
 //! caller falls back to the kernel's copy as before (it says which page
 //! is gone and fills in zeros). A write that faults is not ours to take:
 //! the destination is host memory, which is always there; such a fault
 //! goes on to the handlers after this one.
 
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -36,20 +36,17 @@ core::arch::global_asm!(
     "    mov rcx, r8",
     "victory_copy_guarded_at:",
     "    rep movsb",
-    "    mov rsi, r9",
-    "    mov rdi, r10",
-    "    mov eax, 1",
-    "    ret",
     "victory_copy_guarded_fault:",
+    // RCX is zero on success or the number of bytes left at the fault.
+    "    mov rax, rcx",
     "    mov rsi, r9",
     "    mov rdi, r10",
-    "    xor eax, eax",
     "    ret",
 );
 
 #[cfg(target_arch = "x86_64")]
 unsafe extern "C" {
-    fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> u32;
+    fn victory_copy_guarded(to: *mut u8, from: *const u8, len: usize) -> usize;
     static victory_copy_guarded_at: u8;
     static victory_copy_guarded_fault: u8;
 }
@@ -85,49 +82,60 @@ static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 /// copies in place had won).
 const LEAST: usize = 256;
 
-/// The 64 KiB blocks of title memory a copy in place faulted in lately:
+/// The 64 KiB blocks where a copy in place stopped at a fault:
 /// their copies go straight to the kernel's, which reads round the hole.
 /// By the block's number, in the place its low bits name (a later block
 /// with the same low bits takes the place). Forgotten every two seconds:
 /// the title maps the memory in the end.
-static RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+static RECENT: RecentFaults = RecentFaults::new();
 /// When [`RECENT`] was last emptied (milliseconds of [`now_ms`]).
 static EMPTIED: AtomicU64 = AtomicU64::new(0);
+
+struct RecentFaults([AtomicUsize; 1024]);
+
+impl RecentFaults {
+    const fn new() -> Self {
+        Self([const { AtomicUsize::new(0) }; 1024])
+    }
+
+    fn block(address: usize) -> usize {
+        (address >> 16) + 1 // zero marks an empty slot
+    }
+
+    fn remember(&self, address: usize) {
+        let block = Self::block(address);
+        self.0[block % self.0.len()].store(block, Relaxed);
+    }
+
+    fn contains(&self, from: usize, len: usize) -> bool {
+        let first = Self::block(from);
+        let last = Self::block(from.saturating_add(len - 1));
+        if last - first < self.0.len() {
+            (first..=last).any(|block| self.0[block % self.0.len()].load(Relaxed) == block)
+        } else {
+            // Large copies do not need to probe the same cache slot twice.
+            self.0.iter().any(|slot| (first..=last).contains(&slot.load(Relaxed)))
+        }
+    }
+}
 
 fn now_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
-/// The numbers of the first and last 64 KiB block of `[from, from + len)`,
-/// never 0 (0 is an empty place).
-fn blocks(from: usize, len: usize) -> (usize, usize) {
-    ((from >> 16) | 1 << 63, ((from + len.max(1) - 1) >> 16) | 1 << 63)
-}
-
-/// Whether a copy from there faulted lately.
-fn faulted_lately(from: usize, len: usize) -> bool {
+fn expire_recent_faults() {
     let now = now_ms();
     let emptied = EMPTIED.load(Relaxed);
     if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
-        for place in &RECENT {
+        for place in &RECENT.0 {
             place.store(0, Relaxed);
         }
-        return false;
     }
-    let (first, last) = blocks(from, len);
-    RECENT[first & 1023].load(Relaxed) == first || RECENT[last & 1023].load(Relaxed) == last
 }
 
-/// A copy from there faulted.
-fn note_fault(from: usize, len: usize) {
-    let (first, last) = blocks(from, len);
-    RECENT[first & 1023].store(first, Relaxed);
-    RECENT[last & 1023].store(last, Relaxed);
-}
-
-/// The handler that turns a read fault inside [`guarded`] into its return
-/// of false; put first in the line, once.
+/// The handler that lets [`guarded`] return on a read fault. Installed first
+/// in the chain, once.
 #[cfg(target_arch = "x86_64")]
 fn install() {
     use windows_sys::Win32::Foundation::{
@@ -163,22 +171,22 @@ fn install() {
 #[cfg(not(target_arch = "x86_64"))]
 fn install() {}
 
-/// Copies `len` bytes from `from` to `to` in place; false if a page of the
-/// source was not there (then some of `to` may have been written).
+/// Copies `len` bytes from `from` to `to` in place. Returns the bytes the
+/// copy did not reach when the source faulted, or zero on success.
 ///
 /// `to` must be writable memory of `len` bytes that is ours (host memory);
 /// `from` may be anything.
 #[cfg(target_arch = "x86_64")]
-fn guarded(to: *mut u8, from: *const u8, len: usize) -> bool {
+fn guarded(to: *mut u8, from: *const u8, len: usize) -> usize {
     install();
     // SAFETY: the destination is the caller's to write; a source page that
-    // is not there ends the copy with 0 instead of a fault ([`install`]).
-    unsafe { victory_copy_guarded(to, from, len) != 0 }
+    // is not there ends the copy at our exception handler ([`install`]).
+    unsafe { victory_copy_guarded(to, from, len) }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
-    false
+fn guarded(_: *mut u8, _: *const u8, len: usize) -> usize {
+    len
 }
 
 /// With [`on`]: copies title memory at `from` into host memory at `to`;
@@ -192,19 +200,25 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }
-    if faulted_lately(from as usize, len) {
+    expire_recent_faults();
+    copy_unless_recent_fault(to, from, len, &RECENT)
+}
+
+fn copy_unless_recent_fault(to: *mut u8, from: *const u8, len: usize, recent: &RecentFaults) -> bool {
+    if recent.contains(from as usize, len) {
         COUNT[3].fetch_add(1, Relaxed);
         return false;
     }
-    let whole = guarded(to, from, len);
-    if whole {
+    let remaining = guarded(to, from, len);
+    if remaining == 0 {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
     } else {
         COUNT[2].fetch_add(1, Relaxed);
-        note_fault(from as usize, len);
+        // REP MOVSB stops with the faulting byte still to be copied.
+        recent.remember(from.wrapping_add(len - remaining) as usize);
     }
-    whole
+    remaining == 0
 }
 
 /// With the frame line: what [`copy`] did per frame over `frames`.
@@ -234,10 +248,10 @@ mod tests {
     fn memory_that_is_there_is_copied() {
         let from: Vec<u8> = (0..100_000u32).map(|i| (i * 7 + 3) as u8).collect();
         let mut to = vec![0u8; from.len()];
-        assert!(guarded(to.as_mut_ptr(), from.as_ptr(), from.len()));
+        assert_eq!(guarded(to.as_mut_ptr(), from.as_ptr(), from.len()), 0);
         assert_eq!(to, from);
         // Nothing to copy is a copy.
-        assert!(guarded(to.as_mut_ptr(), from.as_ptr(), 0));
+        assert_eq!(guarded(to.as_mut_ptr(), from.as_ptr(), 0), 0);
     }
 
     /// Three pages reserved, the first committed: a copy that stays in the
@@ -253,41 +267,77 @@ mod tests {
         // SAFETY: committed and writable.
         unsafe { std::slice::from_raw_parts_mut(base, PAGE) }.fill(0xAB);
         let mut to = vec![0u8; 2 * PAGE];
-        assert!(guarded(to.as_mut_ptr(), base, PAGE));
+        assert_eq!(guarded(to.as_mut_ptr(), base, PAGE), 0);
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
         to.fill(0);
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE / 2), PAGE));
+        assert_eq!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE / 2), PAGE), PAGE / 2);
         assert!(to[..PAGE / 2].iter().all(|&b| b == 0xAB), "the bytes before the hole");
         assert!(to[PAGE / 2..].iter().all(|&b| b == 0), "nothing after it");
         // A source that is not there at all.
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE), PAGE));
+        assert_eq!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE), PAGE), PAGE);
         // Committed but closed to reads.
         // SAFETY: the third page of the reservation.
         assert!(!unsafe { VirtualAlloc(base.wrapping_add(2 * PAGE).cast(), PAGE, MEM_COMMIT, PAGE_NOACCESS) }.is_null());
-        assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(2 * PAGE), 16));
+        assert_eq!(guarded(to.as_mut_ptr(), base.wrapping_add(2 * PAGE), 16), 16);
         // And the registers the caller owns came back: this still works.
-        assert!(guarded(to.as_mut_ptr(), base, PAGE));
+        assert_eq!(guarded(to.as_mut_ptr(), base, PAGE), 0);
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
     }
 
-    /// A source that faulted is remembered by its 64 KiB blocks, and only
-    /// those.
+    /// Small copies check just their blocks. Large copies can cover every
+    /// cache slot, including one whose block number wrapped at the table size.
     #[test]
-    fn a_source_that_faulted_is_remembered_by_its_blocks() {
-        // (Addresses no other test uses; the table is shared.)
-        let at = 0x7654_3210_0000usize;
-        assert!(!faulted_lately(at, 4096));
-        note_fault(at + 100, 4096);
-        assert!(faulted_lately(at, 16));
-        assert!(faulted_lately(at + 0xffff, 1));
-        // A copy that ends in the block, and one that begins in it.
-        assert!(faulted_lately(at - 4096, 8192));
-        // The blocks beside it are not remembered.
-        assert!(!faulted_lately(at + 0x10000, 4096));
-        assert!(!faulted_lately(at - 0x10000, 4096));
-        assert_eq!(blocks(0, 0), (1 << 63, 1 << 63));
+    fn recent_faults_match_only_copies_that_touch_the_block() {
+        const BLOCK: usize = 64 << 10;
+        let at = 2049 * BLOCK;
+        let recent = RecentFaults::new();
+        assert!(!recent.contains(at, 4096));
+        recent.remember(at + 100);
+        assert!(recent.contains(at, 16));
+        assert!(recent.contains(at + BLOCK - 1, 1));
+        assert!(recent.contains(at - 4096, 8192));
+        assert!(recent.contains(0, at + 1));
+        assert!(!recent.contains(0, at));
+        assert!(!recent.contains(at + BLOCK, 4096));
+        assert!(!recent.contains(at - BLOCK, 4096));
+        assert!(!recent.contains(at - 1024 * BLOCK, 4096));
+    }
+
+    #[test]
+    fn a_hole_between_readable_blocks_does_not_mark_the_ends() {
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: the test reserves three blocks and commits its own end blocks.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+            .cast::<u8>();
+        assert!(!base.is_null());
+        assert_eq!(base as usize % BLOCK, 0);
+        let end = base.wrapping_add(2 * BLOCK);
+        for (address, byte) in [(base, 0xA5), (end, 0x5A)] {
+            // SAFETY: the block is within the reservation and newly committed.
+            unsafe {
+                assert!(!VirtualAlloc(address.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                address.write_bytes(byte, BLOCK);
+            }
+        }
+        let recent = RecentFaults::new();
+        let mut to = vec![0; 3 * BLOCK];
+        let whole = copy_unless_recent_fault(to.as_mut_ptr(), base, to.len(), &recent);
+        to.fill(0);
+        let first = copy_unless_recent_fault(to.as_mut_ptr(), base, BLOCK, &recent);
+        let last = copy_unless_recent_fault(to[2 * BLOCK..].as_mut_ptr(), end, BLOCK, &recent);
+        let skipped_middle = recent.contains(base.wrapping_add(BLOCK) as usize, BLOCK);
+        let skipped_whole = recent.contains(base as usize, to.len());
+        // SAFETY: the test owns the reservation and is finished reading it.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+
+        assert!(!whole);
+        assert!(first, "an unrelated read of the first committed block must still use the fast path");
+        assert!(last, "an unrelated read of the last committed block must still use the fast path");
+        assert!(skipped_middle && skipped_whole);
+        assert!(to[..BLOCK].iter().all(|&byte| byte == 0xA5));
+        assert!(to[2 * BLOCK..].iter().all(|&byte| byte == 0x5A));
     }
 
     /// Many threads at once, half of them faulting: each gets its own answer.
@@ -304,7 +354,8 @@ mod tests {
                     let mut to = vec![0u8; PAGE];
                     for _ in 0..2_000 {
                         let from = (base + if t % 2 == 0 { 0 } else { PAGE }) as *const u8;
-                        assert_eq!(guarded(to.as_mut_ptr(), from, PAGE), t % 2 == 0);
+                        let remaining = if t % 2 == 0 { 0 } else { PAGE };
+                        assert_eq!(guarded(to.as_mut_ptr(), from, PAGE), remaining);
                     }
                 })
             })
