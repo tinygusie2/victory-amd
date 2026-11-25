@@ -4289,7 +4289,7 @@ impl Host {
                         CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
                         CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
                         for run in runs {
-                            let constants = [run.first, run.skew, size as u32, run.pieces, 0, 0];
+                            let constants = [run.first, run.skew, shadow.card_hashed().unwrap_or(size) as u32, run.pieces, 0, 0];
                             list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                             list.Dispatch(run.pieces.div_ceil(64), 1, 1);
                         }
@@ -4382,7 +4382,8 @@ impl Host {
                         let Some((_, Some(before), size)) = r.shadow.card_sides() else {
                             continue;
                         };
-                        let constants = [r.span.first, r.span.skew, size as u32, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
+                        let hashed = r.shadow.card_hashed().unwrap_or(size) as u32;
+                        let constants = [r.span.first, r.span.skew, hashed, r.span.pieces, r.at * 4, if flown { 2 } else { 1 }];
                         list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
                         list.SetComputeRootShaderResourceView(1, r.shadow.buffer.GetGPUVirtualAddress());
                         list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
@@ -7079,6 +7080,8 @@ impl HostList {
                     batch.title_wrote(dst, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
+                    #[cfg(feature = "diagnostics")]
+                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7091,6 +7094,8 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                         fill_check::runs(src, len);
                     }
+                    #[cfg(feature = "diagnostics")]
+                    let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
                     copy_mapped(dst as *mut u8, src as *const u8, len, false);
                     len
                 }
@@ -7451,6 +7456,13 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     if len == 0 {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    {
+        crate::backreads::touched(src as usize, len, false);
+        if title_dst {
+            crate::backreads::touched(dst as usize, len, false);
+        }
+    }
     // A title destination that is not all mapped is left alone. Asking
     // Windows first (`VirtualQuery`) walks the page tables to the end of
     // the destination's region: in the title's big blocks that is
@@ -7552,6 +7564,8 @@ fn read_pieces(src: *const u8, dst: *mut u8, len: usize) {
 /// Reads title memory at `src` into `dst`; false if a page of it is not
 /// readable.
 pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::touched(src as usize, dst.len(), false);
     // In place first, if asked for (`crate::plaincopy`): the destination is
     // memory of ours, as in `copy_mapped`.
     crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
@@ -7598,6 +7612,8 @@ fn direct_writes() -> bool {
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    crate::backreads::touched(dst as usize, len, true);
     let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
@@ -7849,6 +7865,9 @@ impl Meter {
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
         crate::plaincopy::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::line(frames);
+        crate::shadow::placed_line();
         if let Some(host) = host() {
             host.drain_messages();
         }
