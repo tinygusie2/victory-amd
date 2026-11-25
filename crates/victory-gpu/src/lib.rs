@@ -61,6 +61,8 @@ mod queue2;
 pub mod resource;
 pub mod root;
 #[cfg(windows)]
+mod census;
+#[cfg(windows)]
 mod sampler;
 #[cfg(windows)]
 pub mod shader_cache;
@@ -78,6 +80,8 @@ mod watch;
 
 #[cfg(windows)]
 pub use host::on_failure;
+#[cfg(windows)]
+pub use census::title_memory_reserved;
 #[cfg(windows)]
 pub use inplace::{title_memory_freeing, title_memory_section, title_memory_view};
 #[cfg(windows)]
