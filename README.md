@@ -50,7 +50,7 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 card time that does not add up yet.** No frame-rate gain is claimed; the
 headline numbers stand. (A heavier view of the first room: 122 ms a frame
 at 6,774 draws in run 266. The 97 to 104 ms below are at about 3,850
-draws.) This push is the README only: the code is not in this tree yet.
+draws.) The code of this entry is in the tree.
 - **An outside frame debugger did not work here.** RenderDoc 1.45, loaded
   through a hook (`VICTORY_RENDERDOC=<path of its DLL>`), ended run 263
   after about 10 s of loading: an access violation inside its library,
@@ -166,22 +166,35 @@ draws.) This push is the README only: the code is not in this tree yet.
   texture for lack of room rose (2,067 and 1,280 without; 2,504 and 3,699
   with). Four launches, two each way, and earlier launches without it
   reached 3.4 to 5.1 in the first stretch: a result, not yet a default.
+- **The same copies written straight into the card's memory**
+  (`VICTORY_WINDOW_UPLOAD=1` with `VICTORY_CARD_WINDOWS_MB`, off by
+  default). It needs GPU upload heaps: a resizable BAR, and a driver and
+  a Windows that offer them. The layer asks when it makes the device and
+  says so in the log, and it tries the first such buffer with a plain
+  copy and the kernel's copy and reads it back before any is used. Run
+  273 (closed at 155 s; 0 errors, no driver event, picture right): 368
+  copies (1,400 MB) were one buffer each, with no side in the PC's memory
+  and no pass that sends them up. The PC's memory shared with the card:
+  3.8 GB against 5.7 GB in run 272; free memory 3.2 to 3.6 GB against 1.1
+  to 1.9 GB. Frame rate as run 272, as far as one shortened launch can
+  tell (4.99 and 7.86 frames a second in the first two stretches against
+  5.42 and 8.16). The send-and-hash lists did not fall as predicted (12.3
+  against 13.6 ms a frame at like draws). A memory gain; no speed gain
+  shown.
 - A review of the open pull requests for frame rate found no single large
   gain. The nearest is #1014 (the card-side compare hashes a piece with
   64 threads; a tester's claim on an RTX 4080: send-and-hash lists 14.0
   -> 2.5 ms, compare lists 5.6 -> 1.3 ms). Not measured here.
-- **Next, none of it measured yet:** (1) the shot's own copies taken out
-  of the lists the layer runs before title lists, so the card's frame
-  adds up; (2) those copies as one buffer in a GPU upload heap (the
-  card's memory written directly by the processor through a resizable
-  BAR), with no second copy in the PC's memory and no pass that sends it
-  up: written, not built; (3) what shaders wrote left on the card until
-  the title's processor reads it, where today every changed piece is
-  fetched back every frame (42 to 70 MB): being studied, nothing built;
-  (4) a faster byte compare for the submit thread (8 and 64 bytes at a
-  time; its test of 20,000 cases against the byte-by-byte walk passes;
-  not in a run yet); (5) the texture pass's time budget, 250 ms against
-  less, in turn inside one run (written, not built). Title buffers in
+- **Next, none of it measured yet:** (1) the translated shaders: each
+  shot ranks them by card time, and the title's own commands are 15 to 25
+  ms of the card's frame; (2) the shot's own copies taken out of the
+  lists the layer runs before title lists, so the card's frame adds up;
+  (3) what shaders wrote left on the card until the title's processor
+  reads it, where today every changed piece is fetched back every frame
+  (42 to 70 MB): being studied, nothing built; (4) a faster byte compare
+  for the submit thread (8 and 64 bytes at a time; its test of 20,000
+  cases against the byte-by-byte walk passes; not in a run yet); (5) the
+  texture pass's time budget, 250 ms against less. Title buffers in
   place (`VICTORY_INPLACE`) were listed as the large step; a closer look
   at this PC says otherwise: both ways of opening title memory to the
   card pin it in a PC with 1 to 5 GB free, and the buffer that carries
@@ -489,7 +502,7 @@ Speed and memory:
 - Submissions can be sent ahead of the wait for the card (`VICTORY_LATE_WAIT`), with a relay thread that lands results as the card finishes (`VICTORY_RELAY`): in a first five-minute run the card's idle time behind the submitting thread fell from about 136 to 30 ms per frame.
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
-- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed. A library the driver rejects is kept under another name and never saved over.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 
