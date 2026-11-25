@@ -1147,7 +1147,7 @@ pub(crate) fn log(frames: f64) {
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views noted written by a write through another, {mapped} ranges opened because a view of them was mapped"
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
