@@ -294,6 +294,34 @@ fn copy_unless_recent_fault(to: *mut u8, from: *const u8, len: usize, recent: &R
     remaining == 0
 }
 
+/// With [`on`]: copies title memory at `from` into host memory at `to` for
+/// bytes that are all real, however few (a texture's last pixels, a buffer
+/// written back): no [`LEAST`] floor, since only the reads that ask whether a
+/// page is there, which are expected to fail, keep it ([`copy`]). False if it
+/// is off or a source page was not there (the caller then copies through the
+/// kernel, as before).
+pub(crate) fn copy_buffer(to: *mut u8, from: *const u8, len: usize) -> bool {
+    if !on() {
+        return false;
+    }
+    if len == 0 {
+        return true;
+    }
+    if faulted_lately(from as usize, len) {
+        COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
+    let whole = guarded(to, from, len);
+    if whole {
+        COUNT[0].fetch_add(1, Relaxed);
+        COUNT[1].fetch_add(len as u64, Relaxed);
+    } else {
+        COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
+    }
+    whole
+}
+
 /// With the frame line: what [`copy`] did per frame over `frames`.
 pub(crate) fn line(frames: f64) {
     if !on() {
@@ -328,6 +356,19 @@ mod tests {
         assert_eq!(to, from);
         // Nothing to copy is a copy.
         assert_eq!(guarded(to.as_mut_ptr(), from.as_ptr(), 0), 0);
+    }
+
+    /// [`copy_buffer`] has no [`LEAST`] floor: a buffer of a few bytes (a
+    /// texture's last pixels, a record) is copied in place like any other.
+    /// (Through `guarded`, as `copy_buffer` asks whether the copies are on.)
+    #[test]
+    fn a_buffer_of_a_few_bytes_is_copied() {
+        let from: Vec<u8> = (0..64u32).map(|i| (i * 3 + 1) as u8).collect();
+        for len in [1, 4, 16, 64] {
+            let mut to = vec![0u8; len];
+            assert!(guarded(to.as_mut_ptr(), from.as_ptr(), len));
+            assert_eq!(to, from[..len]);
+        }
     }
 
     /// Three pages reserved, the first committed: a copy that stays in the
