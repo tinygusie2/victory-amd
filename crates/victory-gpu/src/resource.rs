@@ -2298,6 +2298,7 @@ fn hand_out_resource(
     if desc.dimension != BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         textures().insert(at);
+        crate::texback::replaced(resource.data() as usize);
         if !fills(&desc) {
             TARGETS_AT
                 .lock()
@@ -2322,7 +2323,9 @@ impl Drop for Resource {
         // Out of the table of textures first: the sweep looks at the ones
         // in it, under its lock.
         if self.desc.dimension != BUFFER {
-            textures().remove(&(std::ptr::from_ref::<Resource>(self) as usize));
+            let address = std::ptr::from_ref::<Resource>(self) as usize;
+            crate::texback::released(address);
+            textures().remove(&address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;
@@ -2562,7 +2565,9 @@ pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
         return None;
     }
     let r = resource(this);
-    (r.desc.dimension != BUFFER).then_some((r.desc.width, r.desc.height, r.desc.format))
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1)
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
 }
 
 /// Texture `this`'s console layout (one plane), where it lies in title
@@ -2582,29 +2587,6 @@ pub(crate) fn title_texture(this: This) -> Option<(victory_formats::texture::Lay
         return None;
     };
     Some((plane.layout.clone(), r.data() as usize, t.size as usize))
-}
-
-/// Where texture `this` lies in title memory, the bytes it takes there and
-/// its description in short (diagnostics: `crate::readwatch`); `None` for a
-/// buffer or a description without a size.
-#[cfg(all(windows, feature = "diagnostics"))]
-pub(crate) fn title_span(this: This) -> Option<(usize, usize, String)> {
-    if this.is_null() {
-        return None;
-    }
-    let r = resource(this);
-    if r.desc.dimension == BUFFER {
-        return None;
-    }
-    let size = footprint(&r.desc)?.size;
-    Some((
-        r.data() as usize,
-        size as usize,
-        format!(
-            "{}x{}x{} mips {} f{}",
-            r.desc.width, r.desc.height, r.desc.depth_or_array_size, r.desc.mip_levels, r.desc.format
-        ),
-    ))
 }
 
 /// The bytes of title memory a texture with the resource description
