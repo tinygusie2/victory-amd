@@ -44,7 +44,151 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Frame rate in the world | 2-4 fps: 420-450 ms per frame by default, 240-350 ms with the newer switches (`VICTORY_RELAY=2`, or `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_CARD_BUFFERS_MB=1024`); it started at 3-6 seconds per frame |
 | Stability | no driver hang or device loss in normal runs (a hang introduced by the wave64 update was found and fixed: its barrier form for 64-lane programs is now off unless `VICTORY_WAVE_WIDE=1`) |
 
-### Newest (2026-11-25, later the same day)
+### Newest (2026-11-25, evening UTC)
+
+**Update, 2026-11-25 evening: a frame capture built into the layer, and a
+card time that does not add up yet.** No frame-rate gain is claimed; the
+headline numbers stand. (A heavier view of the first room: 122 ms a frame
+at 6,774 draws in run 266. The 97 to 104 ms below are at about 3,850
+draws.) This push is the README only: the code is not in this tree yet.
+- **An outside frame debugger did not work here.** RenderDoc 1.45, loaded
+  through a hook (`VICTORY_RENDERDOC=<path of its DLL>`), ended run 263
+  after about 10 s of loading: an access violation inside its library,
+  then "device suspended" from every host call (its wrapped device; no
+  driver event). The stack showed a streaming program's capture hook
+  making a Direct3D 11-on-12 device on the wrapped device. A MISTAKE of
+  that run: the driver refused the saved pipeline library and the layer
+  saved an empty one over it (366 MB of 3,385 pipelines became 32 bytes;
+  the next run drew black frames at 0.7 to 1.5 frames a second while
+  building them again). Fixed: a rejected library is kept as
+  `host-pipelines.rejected.bin`, never saved over, and with RenderDoc
+  loaded the library is neither read nor saved.
+- **DirectStorage reads wait for the title's Submit** (after upstream
+  VIctory eddde734: its hold and two tests, not its diagnostics). The
+  title fills a batch's page list only right before its Submit; a queue
+  that sent itself when half full started reads into physical pages
+  before that. Run 266: 3 such cases (2,079 reads held of a queue of
+  4,159), no stall, 0 failed page writes, frame time not worse. Faces
+  were right in that one launch; face faults come and go between
+  launches, so a cure is not shown yet.
+- **Processor use, per core and per thread (runs 266, 267): nothing is
+  full.** Of 28 logical processors the machine keeps 6.7 busy in the
+  cutscene and 4.5 in the room, the process about 3.6 and 3.1. The
+  busiest thread, the layer's submit thread, is 42 to 58 % busy; the
+  title's most crowded pinned group is 25 to 29 % full. No look in the
+  room found the render, the submit or a recording thread on a slow core
+  (0 of 1, 0 of 8, 0 of 120). `VICTORY_SPREAD=alt` in the cutscene: 262 ms
+  a frame off, 262 on. The frame is a chain of waits: more cores alone
+  give nothing. Splitting the submit thread's work would use them: it
+  works 83 ms of the room's 122 ms frame (bound: a frame of about 100).
+- **`VICTORY_WIDE_REFRESH=alt`: no gain, dropped** (copies of title memory
+  refreshed on several threads, twenty seconds on, twenty off). Cutscene,
+  run 268: copies 31.2 -> 26.0 ms a frame (17 %) where 10 to 15 ms were
+  predicted. Room, run 269, 10 readings each way: copies 30.6 ms off, 34.1
+  on; submit thread 78.6 against 78.4 ms.
+- **Frame shot: a capture of one frame, built into the layer**
+  (`VICTORY_SHOT=<folder>`; taken when a file named `take` appears there,
+  or at `VICTORY_SHOT_AT=<frames after the first frame of 500 draws>`). A
+  shot holds every command of the frame in order (draws, dispatches,
+  copies, submissions, with list and thread), the card's clock before
+  each command, and a picture of each texture as a pass leaves it. It
+  loads no DLL and wraps no device: only texture read-backs and
+  timestamps, which every run uses already. Hence built in, not outside.
+- With little memory free, a shot takes at most half of what is free
+  above 0.7 GB, and pictures that do not fit are taken in parts from
+  later frames. A shot is exactly one frame of the title: the title
+  records its next frame while the layer still runs this one, and the
+  first form (run 269) held both, so every pass showed twice. It also
+  took 0 pictures: the title uses enhanced barriers and the layer moves
+  textures between states itself; the pictures are now taken there.
+- First shots, run 270 (300 s, 0 errors, no driver event), both in the
+  opening cutscene. Frame 1864: 6,348 lines, 3,618 draws and dispatches,
+  54 pictures of 82 places, then ended early with 685 MB free. Frame
+  2849, complete: 10,334 lines, 7,120 draws and dispatches, 77 of 78
+  pictures. Those looked at are right pictures of the frame.
+- **What the shots say, and what is NOT explained.** Run 270's two
+  frames: the card's time for the title's own commands is 20.1 ms
+  (compute 13.3, drawing 6.3) and 22.0 ms (drawing 11.3, compute 10.1).
+  The older per-list card meter gives the title's lists 57 to 78 ms a
+  frame at that time: 35 to 55 ms more. The shot then got a stamp at
+  every list's start and around the layer's own lists. Run 271's two
+  frames: the title's commands 25.2 and 15.4 ms; the layer's
+  send-and-hash lists 35.0 and 17.8 ms (14 and 8 lists), its compare
+  lists 12.1 and 6.3 ms (13 and 7). The lists it runs before title lists
+  took 36.1 ms in the second frame, but they also hold the shot's own
+  picture copies, not separated yet: the gap is not accounted for. If it
+  is the layer's, the card's ceiling is higher than the "near 20 frames
+  a second" given below, which rests on the per-list meter.
+- **The staging-buffer pool, on and off in turn** (run 270,
+  `VICTORY_STAGING_POOL=alt`, 128 MB kept). On by default; off in test
+  runs since run 224, its first long run, lost the device (cause never
+  found; that driver error had also come up before the pool existed).
+  Predicted: page faults per texture upload from about 100 to well under
+  50, long frames 60 to 115 ms shorter at equal uploads. Measured: 6.27
+  frames a second off, 5.77 on (different scenes; the 7 pairs go both
+  ways). Long frames average 391 ms with 204 uploads off, 421 ms with 310
+  on: 1.92 ms an upload off, 1.36 on, but the texture pass fills its 250
+  ms time budget either way, so frames are no shorter. Page faults per
+  upload: 132.7 off, 128.9 on: prediction not met. No gain shown: not
+  adopted. The frame log's "staging made" counter read 0 with the pool
+  off; it counts now.
+- **Memory, measured.** The process holds about 24 GB, 16 GB of it in
+  memory, on a 32 GB PC. Free: 3.6 GB in the cutscene and 0.9 to 1.8 GB
+  in the room in run 269; 3.6 to 5.3 GB late in run 270 (why they differ
+  is not known). The card is nearly full: 9.0 of a 10.2 GB budget. Title
+  buffers of 1 MiB and more are in its memory in these runs (1,024 MB at
+  most); the 872 copies of what the title's own allocator hands out
+  (vertices, indices, constants: 3.6 GB) are in the PC's memory and read
+  over the bus at every draw. The card has no room for all of them: it
+  would come out of the textures' share.
+- **Some of those copies in the card's memory: fewer long frames, in two
+  launches of two** (`VICTORY_CARD_WINDOWS_MB`, off by default). Run 271
+  asked for 512 MB (124 to 137 copies went to the card), run 272 for
+  2,048 MB (355 copies, 1,356 MB, went there; the layer's own line at 80 %
+  of the card's budget turned the rest down). Both: 300 s, 0 errors, no
+  driver event, pictures right. Frames a second in three stretches of the
+  opening cutscene (20 to 110 s, 110 to 200 s, 200 to 290 s after its
+  first frame), and the share of the last stretch's time spent in frames
+  over 250 ms:
+
+  | run | on the card | first | middle | last | long frames, last stretch |
+  |---|---|---|---|---|---|
+  | 269 | none | 3.95 | 7.49 | 7.59 | 21 % |
+  | 270 | none | 3.93 | 7.99 | 6.68 | 26 % |
+  | 271 | 512 MB | 5.44 | 7.26 | 8.48 | 4 % |
+  | 272 | 1,356 MB | 5.42 | 8.16 | 8.32 | 6 % |
+
+  Textures made again after being let go for lack of room: 5.1 and 6.9 GB
+  in the runs without, 1.9 and 1.1 GB with. That is what the long frames
+  are made of. Why fewer textures are let go is not known: the title's
+  draws cost the card the same per command with and without (+1 %, 37
+  shader sets found in both captures). The price: passes that made no
+  texture for lack of room rose (2,067 and 1,280 without; 2,504 and 3,699
+  with). Four launches, two each way, and earlier launches without it
+  reached 3.4 to 5.1 in the first stretch: a result, not yet a default.
+- A review of the open pull requests for frame rate found no single large
+  gain. The nearest is #1014 (the card-side compare hashes a piece with
+  64 threads; a tester's claim on an RTX 4080: send-and-hash lists 14.0
+  -> 2.5 ms, compare lists 5.6 -> 1.3 ms). Not measured here.
+- **Next, none of it measured yet:** (1) the shot's own copies taken out
+  of the lists the layer runs before title lists, so the card's frame
+  adds up; (2) those copies as one buffer in a GPU upload heap (the
+  card's memory written directly by the processor through a resizable
+  BAR), with no second copy in the PC's memory and no pass that sends it
+  up: written, not built; (3) what shaders wrote left on the card until
+  the title's processor reads it, where today every changed piece is
+  fetched back every frame (42 to 70 MB): being studied, nothing built;
+  (4) a faster byte compare for the submit thread (8 and 64 bytes at a
+  time; its test of 20,000 cases against the byte-by-byte walk passes;
+  not in a run yet); (5) the texture pass's time budget, 250 ms against
+  less, in turn inside one run (written, not built). Title buffers in
+  place (`VICTORY_INPLACE`) were listed as the large step; a closer look
+  at this PC says otherwise: both ways of opening title memory to the
+  card pin it in a PC with 1 to 5 GB free, and the buffer that carries
+  the most traffic cannot be opened at all. A memory step and a modest
+  time step, not the road to 30 frames a second by itself.
+
+### Earlier (up to 2026-11-25 afternoon)
 
 **Update, 2026-11-25 afternoon: what a frame is made of, measured, and two
 changes that hold.** First rooms, about 3,850 draws a frame: 104 ms a frame
@@ -99,7 +243,7 @@ with all of them, from about 120 ms in the morning. Still far from the console's
   about 50 ms are the title's own ~30 compute passes and its geometry at
   2560x1440 as translated. With every pass of the layer's gone, this
   scene would still be near 20 frames a second on this card: the
-  translated shaders have to get cheaper too.
+  translated shaders have to get cheaper too. (Open again: see the evening update above.)
 - The frame rate is drawn into the top left corner of every frame shown
   (`fpsbox.rs`; `VICTORY_FPS_COUNTER=0`: not): the window's caption has
   it too, but a capture of the picture does not carry the caption.
@@ -358,7 +502,7 @@ Each is described in a comment where it is read.
 
 - Everything in shadow is black (see above).
 - The interior of the first gameplay room is sometimes not drawn after the cutscene hands over to gameplay.
-- Around 24 GB of memory is in use during play.
+- Around 24 GB of memory is in use during play, about 16 GB of it in memory: the 32 GB test PC has about 1 to 5 GB free, and the 12 GB card is nearly full, so textures are let go and made again for lack of room.
 - A few style lints are switched off for this fork in the workspace `Cargo.toml` until the newer code is tidied.
 - Many changes here are specific to this title and this GPU, and some are marked `shortcut:` in the code where they approximate what the console does.
 
