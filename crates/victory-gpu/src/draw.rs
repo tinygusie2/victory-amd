@@ -1640,6 +1640,8 @@ impl State {
         static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
         let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
         let whole = whole.get_or_insert_with(Default::default);
+        let mut eligible: Vec<(&std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
+            Vec::with_capacity(spans.len());
         for (shadow, from, to) in spans.values() {
             if shadow.unwatched() {
                 // By the copy's number: a copy made where one let go was
@@ -1660,8 +1662,10 @@ impl State {
                     }
                 }
             }
-            shadow.refresh(list, *from, to - from);
+            eligible.push((shadow, *from, *to - *from));
         }
+        // All the spans in under one lock of the list: some 4,600 a frame.
+        crate::shadow::Shadow::refresh_many(list, eligible);
         let textures_began = std::time::Instant::now();
         self.heap_textures(list, heap, host);
         HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
