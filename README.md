@@ -133,9 +133,15 @@ What did it, on top of the list below:
     frame (`VICTORY_CAPTURE_WORLD`, every 8th world frame) is read back
     and written as a PNG inside the present, 235 ms each.
     `VICTORY_CAPTURE_WORLD_EVERY=64` for runs that measure speed.
-  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments:
-    6.0 -> 8.9 frames a second on average in the first room, 3.1 -> 4.2
-    in the opening cutscene.
+  - `VICTORY_INDIRECT_WINDOW=1` measured again with those instruments. A
+    CORRECTION: the first figures given here (6.0 against 8.9 frames a
+    second) compared two runs that stood in different scenes during the
+    measured window (about 4,300 against 1,550 draws a frame) and are
+    withdrawn. Compared at equal draws, by a line fitted to each run's
+    frame times against its draws per frame: windows off 145 ms at 4,500
+    draws and 271 ms at 10,000; windows on with `VICTORY_COPY_PLAIN=1`
+    124 ms and 211 ms. On screen: 7-8 frames a second in the first rooms,
+    10-12 in their lighter views.
   - A driver watch (on by default; `VICTORY_DRIVER_WATCH=0` off): the
     layer subscribes to the system's event log and logs every entry of a
     display driver as it is recorded; the first one turns draw windows
@@ -150,10 +156,22 @@ What did it, on top of the list below:
     sync looks at a changed page's records under one lock, fingerprint
     first; guarded view memory is left out of a submission's write-watch
     askings ahead (after triippywhale).
-  - Behind switches, built and unit-tested, not yet shown to pay:
-    `VICTORY_COPY_PLAIN=1` (copies of title memory made in place by this
+  - `VICTORY_COPY_PLAIN=1`: copies of title memory made in place by this
     process, with a handler that falls back to the kernel's copy on a
-    missing page), `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
+    missing page. Its first form also took the layer's one-byte "is this
+    page there" reads, 1,000 to 1,300 faults a frame, and won nothing;
+    reads under 256 bytes now stay with the kernel and a source that
+    faulted is left alone for two seconds (4 to 9 faults a frame). The
+    submit thread's kernel time fell from 44 to 20 ms a frame; the
+    picture is the same.
+  - The layer's submit and copy-back threads ask for the fast cores of a
+    hybrid processor (`VICTORY_FAST_CORES=0`: not): the submit thread was
+    found on a slow core in 6 % of its looks, now in none of 21,059.
+    `VICTORY_DISK_CORES=slow` (off, not measured) asks the slow cores for
+    the DirectStorage workers, which are as many as the logical
+    processors and free to run anywhere.
+  - Behind switches, built and unit-tested, not yet shown to pay:
+    `VICTORY_REFRESH_ONCE=1`, `VICTORY_VIEW_KNOWN=1`,
     `VICTORY_BACK_OWN_VIEW=1` (picture to be checked),
     `VICTORY_ASYNC_PRESENT=1` (the present goes behind the queue's line;
     no gain while the card is the limit).
@@ -168,6 +186,12 @@ What did it, on top of the list below:
   Still open: the per-record clamp is most of the card's time, and the
   copies between the PC's memory and the card's are most of the submit
   thread's; the cause of the one device loss with windows is not known.
+  A first play session past the first rooms reached the open world and
+  lost the device there with no driver entry (reason "device removed"):
+  the card had no room for new textures from the opening cutscene on
+  (9.2 of a 10.3 GB budget on a 12 GB card; 2,073 passes made no texture
+  for lack of room; 44,613 textures let go and made again in 13 minutes).
+  Cause of that removal not known either.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).

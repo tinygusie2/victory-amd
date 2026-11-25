@@ -469,6 +469,7 @@ fn wake() {
 /// to run, each time something was added or a fence moved.
 #[cfg(windows)]
 fn worker() {
+    crate::framelog::keep_on_fast_cores("victory-submit");
     loop {
         {
             let mut work = lock(&WORK.0);

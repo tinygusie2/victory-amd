@@ -71,9 +71,60 @@ pub(crate) fn on() -> bool {
     })
 }
 
-/// Copies made in place, their bytes, and the copies that met a page that
-/// was not there (and went to the kernel's copy), since the last line.
-static COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Copies made in place, their bytes, the copies that met a page that was
+/// not there (and went to the kernel's copy), and the copies not tried in
+/// place because their source faulted lately ([`RECENT`]) or they were
+/// under [`LEAST`] bytes, since the last line.
+static COUNT: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// The fewest bytes copied in place. A read of a byte or a word is how the
+/// layer ASKS whether a page is there (a texture's first page, a record):
+/// it is expected to fail, and a failed kernel read costs a microsecond
+/// where a fault and its handler cost tens (run 230: 1,000 to 1,300 faults
+/// a frame, nearly all of them such askings, took back most of what the
+/// copies in place had won).
+const LEAST: usize = 256;
+
+/// The 64 KiB blocks of title memory a copy in place faulted in lately:
+/// their copies go straight to the kernel's, which reads round the hole.
+/// By the block's number, in the place its low bits name (a later block
+/// with the same low bits takes the place). Forgotten every two seconds:
+/// the title maps the memory in the end.
+static RECENT: [std::sync::atomic::AtomicUsize; 1024] = [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+/// When [`RECENT`] was last emptied (milliseconds of [`now_ms`]).
+static EMPTIED: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// The numbers of the first and last 64 KiB block of `[from, from + len)`,
+/// never 0 (0 is an empty place).
+fn blocks(from: usize, len: usize) -> (usize, usize) {
+    ((from >> 16) | 1 << 63, ((from + len.max(1) - 1) >> 16) | 1 << 63)
+}
+
+/// Whether a copy from there faulted lately.
+fn faulted_lately(from: usize, len: usize) -> bool {
+    let now = now_ms();
+    let emptied = EMPTIED.load(Relaxed);
+    if now.saturating_sub(emptied) >= 2_000 && EMPTIED.compare_exchange(emptied, now, Relaxed, Relaxed).is_ok() {
+        for place in &RECENT {
+            place.store(0, Relaxed);
+        }
+        return false;
+    }
+    let (first, last) = blocks(from, len);
+    RECENT[first & 1023].load(Relaxed) == first || RECENT[last & 1023].load(Relaxed) == last
+}
+
+/// A copy from there faulted.
+fn note_fault(from: usize, len: usize) {
+    let (first, last) = blocks(from, len);
+    RECENT[first & 1023].store(first, Relaxed);
+    RECENT[last & 1023].store(last, Relaxed);
+}
 
 /// The handler that turns a read fault inside [`guarded`] into its return
 /// of false; put first in the line, once.
@@ -137,12 +188,21 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !on() {
         return false;
     }
+    if len < LEAST {
+        COUNT[4].fetch_add(1, Relaxed);
+        return false;
+    }
+    if faulted_lately(from as usize, len) {
+        COUNT[3].fetch_add(1, Relaxed);
+        return false;
+    }
     let whole = guarded(to, from, len);
     if whole {
         COUNT[0].fetch_add(1, Relaxed);
         COUNT[1].fetch_add(len as u64, Relaxed);
     } else {
         COUNT[2].fetch_add(1, Relaxed);
+        note_fault(from as usize, len);
     }
     whole
 }
@@ -152,10 +212,11 @@ pub(crate) fn line(frames: f64) {
     if !on() {
         return;
     }
-    let [copies, bytes, gone] = [0, 1, 2].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
+    let [copies, bytes, gone, lately, small] = [0, 1, 2, 3, 4].map(|i| COUNT[i].swap(0, Relaxed) as f64 / frames);
     tracing::info!(
         "copies of title memory made in place per frame (VICTORY_COPY_PLAIN=1): {copies:.0}, {:.1} MB; {gone:.1} met a page \
-         that was not there and went through the kernel's copy",
+         that was not there and went through the kernel's copy; left to the kernel's copy untried: {lately:.0} whose source \
+         faulted in the last two seconds, {small:.0} of under {LEAST} bytes",
         bytes / 1e6
     );
 }
@@ -209,6 +270,24 @@ mod tests {
         assert!(to[..PAGE].iter().all(|&b| b == 0xAB));
         // SAFETY: the test's reservation.
         unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// A source that faulted is remembered by its 64 KiB blocks, and only
+    /// those.
+    #[test]
+    fn a_source_that_faulted_is_remembered_by_its_blocks() {
+        // (Addresses no other test uses; the table is shared.)
+        let at = 0x7654_3210_0000usize;
+        assert!(!faulted_lately(at, 4096));
+        note_fault(at + 100, 4096);
+        assert!(faulted_lately(at, 16));
+        assert!(faulted_lately(at + 0xffff, 1));
+        // A copy that ends in the block, and one that begins in it.
+        assert!(faulted_lately(at - 4096, 8192));
+        // The blocks beside it are not remembered.
+        assert!(!faulted_lately(at + 0x10000, 4096));
+        assert!(!faulted_lately(at - 0x10000, 4096));
+        assert_eq!(blocks(0, 0), (1 << 63, 1 << 63));
     }
 
     /// Many threads at once, half of them faulting: each gets its own answer.
