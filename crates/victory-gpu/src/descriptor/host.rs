@@ -3586,6 +3586,22 @@ mod tests {
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + heap.dynamic - 40));
     }
+
+    #[test]
+    fn dynamic_slots_can_span_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        let first = heap.dynamic(heap.dynamic).unwrap();
+        heap.release(first, 12);
+        assert_eq!(heap.dynamic(12), Some(first));
+
+        // The cursor is at 12 and everything is taken. Free slots 10..14:
+        // the only four-slot run starts before the cursor and ends after it.
+        heap.release(first + 10, 4);
+        assert_eq!(heap.dynamic(4), Some(first + 10));
+        eprintln!("allocated the free run across the cursor");
+    }
 }
 
 #[cfg(test)]
