@@ -707,7 +707,16 @@ fn absent_once() -> bool {
 /// 1 to 1000.
 fn absent_keep_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MS.get_or_init(|| std::env::var("VICTORY_ABSENT_MS").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(100, |n| n.clamp(1, 1000)))
+    *MS.get_or_init(|| match std::env::var("VICTORY_ABSENT_MS").as_deref().map(str::trim) {
+        // Until the runtime tells of the block ([`title_memory_remapped`],
+        // [`title_memory_committed`]): no question to Windows at all for a
+        // block noted uncommitted. Run 279 with 100 ms: 600,000 to 690,000
+        // questions in twenty seconds without the notes, and still 357,000
+        // to 604,000 with them, because a frame is as long as a note lives.
+        Ok("told") => u64::MAX,
+        Ok(v) => v.parse::<u64>().map_or(100, |n| n.clamp(1, 1000)),
+        Err(_) => 100,
+    })
 }
 
 /// Since they were last taken ([`absent_looks`]): questions to Windows
@@ -1224,6 +1233,27 @@ pub fn title_memory_reading_now() -> Option<Reading> {
         Ok(guard) => Some(Reading(guard)),
         Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
         Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// The runtime committed title memory `[at, at + len)` for the title
+/// (`XMemVirtualAlloc` with a commit): what [`absent_once`] noted about its
+/// blocks is forgotten, so the next asking puts the question to Windows
+/// again, as every asking did before the notes. With `VICTORY_ABSENT_MS=told`
+/// this and [`title_memory_remapped`] are the only ways a block noted
+/// uncommitted is asked about again.
+pub fn title_memory_committed(at: usize, len: usize) {
+    if len == 0 || absent_mode() == 0 {
+        return;
+    }
+    let mut g = guards();
+    if g.verified.is_empty() {
+        return;
+    }
+    let (first, last) = (at / BLOCK, at.saturating_add(len).div_ceil(BLOCK));
+    let noted: Vec<usize> = g.verified.range(first..last).map(|(&block, _)| block).collect();
+    for block in noted {
+        g.verified.remove(&block);
     }
 }
 

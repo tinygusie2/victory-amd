@@ -1687,7 +1687,8 @@ void main(uint3 id : SV_DispatchThreadID) {
 "#;
 
 /// [`CARD_COMPARE`] with a group of 64 threads to a piece
-/// (`VICTORY_CARD_HASH_WIDE`, on by default; `=0` for the thread a piece).
+/// (`VICTORY_CARD_HASH_WIDE=1`; the thread a piece unless asked). After fork
+/// pull request #1014 by martindevbr.
 ///
 /// With a thread a piece, a pass hashes its 64 KiB pieces in 4,096 steps
 /// one after the other, and its time is that of one piece however few
@@ -1754,11 +1755,19 @@ void main(uint3 group : SV_GroupID, uint t : SV_GroupIndex) {
 }
 "#;
 
-/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE`;
-/// on unless `0`). Chosen once: stored and compared hashes must agree.
+/// Whether [`CARD_COMPARE_WIDE`] is the compare (`VICTORY_CARD_HASH_WIDE=1`;
+/// off unless asked: it has not run in a game on this tree yet, and it is
+/// another hash with another rare pattern of changes it cannot see). Chosen
+/// once and said in the log: stored and compared hashes must agree.
 pub(crate) fn card_hash_wide() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_HASH_WIDE").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_CARD_HASH_WIDE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("the card's hashes of copies' pieces are made by a group of 64 threads a piece (VICTORY_CARD_HASH_WIDE=1)");
+        }
+        on
+    })
 }
 
 /// The compare's source for this process ([`card_hash_wide`]).
