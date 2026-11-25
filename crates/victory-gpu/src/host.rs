@@ -2049,6 +2049,28 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// Empties the recording for the list's next use, keeping the capacity
+    /// of every collection (a reset is per submission, and the sets and
+    /// vectors grow back the same way every time). The same state
+    /// [`Deferred::default`] gives, so nothing leaks across resets: the
+    /// held uploads pass out of [`ALIVE`] as they would when dropped.
+    fn clear(&mut self) {
+        ALIVE[6].fetch_sub(self.uploads.len() as u64, Ordering::Relaxed);
+        ALIVE[7].fetch_sub(self.upload_bytes, Ordering::Relaxed);
+        self.copies.clear();
+        self.uploads.clear();
+        self.upload_bytes = 0;
+        self.kept.clear();
+        self.refreshed.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.backs.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
+        self.budget_zeroed = false;
+        self.indirect_readable = 0;
+    }
 }
 
 impl Drop for Deferred {
@@ -6283,7 +6305,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7697,6 +7719,17 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    if direct_writes() {
+        // SAFETY: the destination is mapped writable memory of `len` bytes;
+        // the kernel checks the source. A short or partial read returns a
+        // negative status (`STATUS_PARTIAL_COPY`), which leaves the piece
+        // walk in `read_pieces` to zero what cannot be read; `done == len`
+        // keeps that true of a success that is somehow short.
+        let status = unsafe {
+            NtReadVirtualMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done)
+        };
+        return status >= 0 && done == len;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -7714,6 +7747,18 @@ unsafe extern "system" {
         size: usize,
         written: *mut usize,
     ) -> i32;
+
+    /// The kernel's read from a process's memory, `(process, address,
+    /// bytes, length, read out)`: an NTSTATUS, negative when a page of the
+    /// range is not there or not readable (`STATUS_PARTIAL_COPY` when only
+    /// part of it is). It changes no protection.
+    fn NtReadVirtualMemory(
+        process: *mut std::ffi::c_void,
+        base: *const std::ffi::c_void,
+        buffer: *mut std::ffi::c_void,
+        size: usize,
+        read: *mut usize,
+    ) -> i32;
 }
 
 /// Whether title memory is written with the kernel's own call
@@ -7721,7 +7766,9 @@ unsafe extern "system" {
 /// what the pages are (as `VirtualQuery` does: about 2 ms a call in the
 /// title's big pools, see [`copy_mapped`]): putting back what shaders wrote
 /// cost 1.2-1.9 s a frame for 430-800 pieces, 2 ms each whatever their size
-/// (run 24). On by default; `VICTORY_DIRECT_WRITES=0` writes as before.
+/// (run 24). The same switch reads with `NtReadVirtualMemory`, as
+/// `ReadProcessMemory` asks the same question. On by default;
+/// `VICTORY_DIRECT_WRITES=0` writes and reads as before.
 fn direct_writes() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_DIRECT_WRITES").is_none_or(|v| v != "0"))

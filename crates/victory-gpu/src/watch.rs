@@ -946,12 +946,44 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    // The blocks we hold are sorted, so each run of them that is contiguous
+    // is given back in one call: a long write (`fread`) opens hundreds of
+    // blocks, and every call walks the page tables.
+    let mut at = 0;
+    while at < blocks.len() {
+        let run_start = blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < blocks.len() && blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        for block in run_start..run_end {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+        let n = run_end - run_start;
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        let set = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                n * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            )
+        };
+        if set == 0 && n > 1 {
+            // A run can span a placeholder and the views over it, which the
+            // kernel only lets be given back one region at a time.
+            for block in run_start..run_end {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                };
+            }
+        }
     }
     !blocks.is_empty()
 }
