@@ -69,6 +69,10 @@ pub(crate) struct Shadow {
     /// With [`cards`], for a big title buffer: `buffer` is in the card's
     /// own memory, and this is the rest of the copy.
     card: Option<Card>,
+    /// Serializes `merge_under_writes` (write lock) against concurrent
+    /// `card_merge_relay` workers merging disjoint 64 KiB pieces (read lock)
+    /// on a carded copy.
+    card_merge_lock: std::sync::RwLock<()>,
     /// A window of title memory outside buffers, not a title buffer's copy.
     window: bool,
     /// With `crate::inplace`: not a copy at all. `buffer` is placed in a
@@ -2443,6 +2447,7 @@ impl Shadow {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             },
             card: None,
+            card_merge_lock: std::sync::RwLock::new(()),
             window: false,
             place: None,
         }
@@ -3075,24 +3080,24 @@ impl Shadow {
                 }
                 let n = hi - lo;
                 let title = &mut title[..n];
-                // The lock of the copy's reference (the snapshot, or the
-                // CPU's side of a copy in the card's memory), from before
-                // title memory is read until the title's bytes are in: with
-                // the copy-back on its own thread ([`relay`]) that thread
-                // puts what the card wrote into title memory and into the
-                // reference under the same lock, and a page read before
-                // such a merge and compared after it would take the card's
-                // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-                // A page that is not there is left as it is, and looked at
-                // again next time.
-                if !crate::host::read_into(lo as *const u8, title) {
-                    continue;
-                }
-                MERGED[0].fetch_add(1, Ordering::Relaxed);
-                let at = lo - start;
                 let mut merged_bytes = 0;
                 if self.card.is_some() {
+                    // The write lock of the copy's carded merge, from before
+                    // title memory is read until the title's bytes are in:
+                    // with the copy-back on its own thread ([`relay`]) that
+                    // thread puts what the card wrote into title memory and
+                    // into the CPU's side under the read lock, on disjoint
+                    // 64 KiB pieces at a time, and a page read before such a
+                    // merge and compared after it would take the card's
+                    // bytes for the title's.
+                    let _side = self.card_merge_lock.write().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked
+                    // at again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -3107,6 +3112,21 @@ impl Shadow {
                         merged_bytes += m;
                     }
                 } else {
+                    // The lock of the copy's reference (the snapshot), from
+                    // before title memory is read until the title's bytes
+                    // are in: with the copy-back on its own thread
+                    // ([`relay`]) that thread puts what the card wrote into
+                    // title memory and into the snapshot under the same
+                    // lock, and a page read before such a merge and compared
+                    // after it would take the card's bytes for the title's.
+                    let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                    // A page that is not there is left as it is, and looked
+                    // at again next time.
+                    if !crate::host::read_into(lo as *const u8, title) {
+                        continue;
+                    }
+                    MERGED[0].fetch_add(1, Ordering::Relaxed);
+                    let at = lo - start;
                     let Some(snapshot) = before.as_mut() else {
                         return true;
                     };
@@ -3123,8 +3143,8 @@ impl Shadow {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         merged_bytes += m;
                     }
+                    drop(before);
                 }
-                drop(before);
                 if !runs.is_empty() {
                     MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
                     MERGED[2].fetch_add(merged_bytes as u64, Ordering::Relaxed);
@@ -3557,11 +3577,12 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.card_merge_lock.read().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
-        // holds the lock held here.
+        // holds the write lock held here, and concurrent callers of this
+        // work on disjoint 64 KiB pieces partitioned by (copy, piece).
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
         let Some(first) = first_difference(gpu, held) else {
             return 0;
