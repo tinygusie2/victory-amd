@@ -290,6 +290,44 @@ mod tests {
         assert_eq!(blocks(0, 0), (1 << 63, 1 << 63));
     }
 
+    #[test]
+    fn a_hole_between_readable_blocks_does_not_mark_the_ends() {
+        if !on() {
+            eprintln!("set VICTORY_COPY_PLAIN=1 to exercise the fault cache");
+            return;
+        }
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: the test reserves three blocks and commits its own end blocks.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 3 * BLOCK, MEM_RESERVE, PAGE_NOACCESS) }
+            .cast::<u8>();
+        assert!(!base.is_null());
+        assert_eq!(base as usize % BLOCK, 0);
+        let end = base.wrapping_add(2 * BLOCK);
+        for (address, byte) in [(base, 0xA5), (end, 0x5A)] {
+            // SAFETY: the block is within the reservation and newly committed.
+            unsafe {
+                assert!(!VirtualAlloc(address.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE).is_null());
+                address.write_bytes(byte, BLOCK);
+            }
+        }
+        let mut to = vec![0; 3 * BLOCK];
+        let whole = copy(to.as_mut_ptr(), base, to.len());
+        to.fill(0);
+        let first = copy(to.as_mut_ptr(), base, BLOCK);
+        let last = copy(to[2 * BLOCK..].as_mut_ptr(), end, BLOCK);
+        let skipped_middle = faulted_lately(base.wrapping_add(BLOCK) as usize, BLOCK);
+        let skipped_whole = faulted_lately(base as usize, to.len());
+        // SAFETY: the test owns the reservation and is finished reading it.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+
+        assert!(!whole);
+        assert!(first, "an unrelated read of the first committed block must still use the fast path");
+        assert!(last, "an unrelated read of the last committed block must still use the fast path");
+        assert!(skipped_middle && skipped_whole);
+        assert!(to[..BLOCK].iter().all(|&byte| byte == 0xA5));
+        assert!(to[2 * BLOCK..].iter().all(|&byte| byte == 0x5A));
+    }
+
     /// Many threads at once, half of them faulting: each gets its own answer.
     #[test]
     fn threads_fault_and_copy_side_by_side() {
