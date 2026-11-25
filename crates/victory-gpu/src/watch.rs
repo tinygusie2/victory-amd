@@ -761,10 +761,12 @@ fn is_view(start: usize, end: usize) -> bool {
 /// one of those is this memory written, and only a fault can say so.
 /// `VICTORY_VIEW_GUARD=0` leaves the other views as they are, as before.
 fn protect(g: &mut Guards, from: usize, to: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
     protect_here(g, from, to);
     if !view_guard() {
         return;
     }
+    let mut alias_blocks: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -781,9 +783,48 @@ fn protect(g: &mut Guards, from: usize, to: usize) {
             for alias in shown {
                 let alias = alias / BLOCK;
                 g.aliased.insert(alias);
-                if alias != block {
-                    protect_alias(g, alias);
+                if alias != block && !g.protected.contains(&alias) {
+                    alias_blocks.push(alias);
                 }
+            }
+        }
+    }
+    // Blocks that follow one another are made read-only in one call, as
+    // `protect_alias` does for each of them one at a time.
+    if alias_blocks.len() > 1 {
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+    }
+    let mut at = 0;
+    while at < alias_blocks.len() {
+        let run_start = alias_blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < alias_blocks.len() && alias_blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        let n = run_end - run_start;
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let set = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                n * BLOCK,
+                PAGE_READONLY,
+                &mut old,
+            )
+        };
+        if set != 0 {
+            g.protected.extend(run_start..run_end);
+            if view_known() {
+                g.viewed.extend(run_start..run_end);
+            }
+        } else {
+            // A run can span views the kernel only lets be guarded one
+            // region at a time, leaving out the ones that fail.
+            for block in run_start..run_end {
+                protect_alias(g, block);
             }
         }
     }
@@ -926,12 +967,44 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         .range(start / BLOCK..end.div_ceil(BLOCK))
         .copied()
         .collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    // The blocks we hold are sorted, so each run of them that is contiguous
+    // is given back in one call: a long write (`fread`) opens hundreds of
+    // blocks, and every call walks the page tables.
+    let mut at = 0;
+    while at < blocks.len() {
+        let run_start = blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < blocks.len() && blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        for block in run_start..run_end {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
+        let n = run_end - run_start;
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        let set = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                n * BLOCK,
+                PAGE_READWRITE,
+                &mut old,
+            )
+        };
+        if set == 0 && n > 1 {
+            // A run can span a placeholder and the views over it, which the
+            // kernel only lets be given back one region at a time.
+            for block in run_start..run_end {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe {
+                    VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old)
+                };
+            }
+        }
     }
     !blocks.is_empty()
 }
