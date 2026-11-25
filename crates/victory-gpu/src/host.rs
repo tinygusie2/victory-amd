@@ -336,6 +336,142 @@ pub(crate) fn removal_context() -> String {
     text
 }
 
+/// The card's memory at every look since [`video_memory_line`] last took
+/// them: the most of the card's own in use, the least its budget was, the
+/// most of the PC's shared memory in use, and the looks. A look is every
+/// asking of [`Host::video_memory`] (the texture queue's, the card copies')
+/// and one of our own at most every tenth of a second
+/// ([`Host::video_memory_look`]). The memory line is one look in five
+/// seconds: what the card held between two of them was not known (runs 277
+/// and 279 lost the device at 90 and 92 hundredths of the budget by it).
+static VIDEO_PEAK: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// [`memory_counts`] as they were when [`video_memory_line`] was last said,
+/// and when that was ([`now_ms`]).
+static MEMORY_MARK: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// Running totals for [`video_memory_line`] and [`removal_memory`]: the
+/// bytes of upload, shared and card buffers made since the start
+/// ([`MADE`]), the bytes of host textures alive, the bytes of host copies
+/// of textures let go since the start, and host copies of textures made
+/// since the start.
+fn memory_counts() -> [u64; 6] {
+    [
+        MADE[1].load(Ordering::Relaxed),
+        MADE[3].load(Ordering::Relaxed),
+        MADE[5].load(Ordering::Relaxed),
+        crate::resource::HOST_TEXTURES[1].load(Ordering::Relaxed),
+        crate::resource::KINDS[3].load(Ordering::Relaxed),
+        crate::resource::KINDS[6].load(Ordering::Relaxed),
+    ]
+}
+
+/// With the frame-rate line, about once a second: what the looks at the
+/// card's memory saw since the last such line ([`VIDEO_PEAK`], taken), and
+/// what was made in that time ([`memory_counts`], noted for the next line
+/// and for a removal). `VICTORY_VIDEO_LOOK=0`: no line.
+fn video_memory_line() {
+    if !video_look_on() {
+        return;
+    }
+    let most = VIDEO_PEAK[0].swap(0, Ordering::Relaxed);
+    let least = VIDEO_PEAK[1].swap(u64::MAX, Ordering::Relaxed);
+    let shared = VIDEO_PEAK[2].swap(0, Ordering::Relaxed);
+    let looks = VIDEO_PEAK[3].swap(0, Ordering::Relaxed);
+    let now = memory_counts();
+    let then = [0, 1, 2, 3, 4, 5].map(|i| MEMORY_MARK[i].swap(now[i], Ordering::Relaxed));
+    let at = now_ms();
+    let before = MEMORY_MARK[6].swap(at, Ordering::Relaxed);
+    if looks == 0 {
+        return;
+    }
+    tracing::info!(
+        "video memory in the {} ms since the last such line, at {looks} looks: the card's own in use at most {} MB, its budget at least {} MB, \
+         the PC's shared in use at most {} MB; made in that time: upload buffers {} MB, shared buffers {} MB, card buffers {} MB, \
+         {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        at.saturating_sub(before),
+        most >> 20,
+        least >> 20,
+        shared >> 20,
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    );
+}
+
+/// Whether the card's memory is looked at between the memory lines
+/// (`VICTORY_VIDEO_LOOK=0`: not; on by default).
+fn video_look_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_VIDEO_LOOK").is_none_or(|v| v != "0"))
+}
+
+/// The memory side of a removal, for [`log_removal_context`]: the process's
+/// and the PC's memory at this moment, what the looks at the card's memory
+/// saw since the last [`video_memory_line`] ([`VIDEO_PEAK`], not taken),
+/// and what was made since that line. Atomics and two plain questions to
+/// the system: no lock of ours.
+fn removal_memory() -> String {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain data the call fills in.
+    let mut c: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: our own process and a sized structure.
+    unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb) };
+    // SAFETY: plain data the call fills in.
+    let mut p: PERFORMANCE_INFORMATION = unsafe { std::mem::zeroed() };
+    p.cb = size_of::<PERFORMANCE_INFORMATION>() as u32;
+    // SAFETY: a sized structure.
+    unsafe { K32GetPerformanceInfo(&mut p, p.cb) };
+    // The system counts in pages.
+    let pages = |n: usize| (n as u64 * p.PageSize as u64) >> 20;
+    let peak = [0, 1, 2, 3].map(|i| VIDEO_PEAK[i].load(Ordering::Relaxed));
+    let then = [0, 1, 2, 3, 4, 5, 6].map(|i| MEMORY_MARK[i].load(Ordering::Relaxed));
+    let now = memory_counts();
+    format!(
+        "the process: {} MB private (at most {} MB), {} MB of it in memory (at most {} MB); the PC: {} MB free of {} MB, {} MB committed of a limit of {} MB \
+         (at most {} MB), the kernel's own {} MB paged and {} MB not paged, {} handles; the card's memory at the {} looks since the last line of it: \
+         in use at most {} MB, the budget at least {} MB, the PC's shared in use at most {} MB; made in the {} ms since that line: upload buffers {} MB, \
+         shared buffers {} MB, card buffers {} MB, {} host copies of textures; host textures alive {} MB (then {} MB), {} MB of filled ones let go",
+        c.PagefileUsage as u64 >> 20,
+        c.PeakPagefileUsage as u64 >> 20,
+        c.WorkingSetSize as u64 >> 20,
+        c.PeakWorkingSetSize as u64 >> 20,
+        pages(p.PhysicalAvailable),
+        pages(p.PhysicalTotal),
+        pages(p.CommitTotal),
+        pages(p.CommitLimit),
+        pages(p.CommitPeak),
+        pages(p.KernelPaged),
+        pages(p.KernelNonpaged),
+        p.HandleCount,
+        peak[3],
+        peak[0] >> 20,
+        if peak[1] == u64::MAX { 0 } else { peak[1] >> 20 },
+        peak[2] >> 20,
+        now_ms().saturating_sub(then[6]),
+        now[0].saturating_sub(then[0]) >> 20,
+        now[1].saturating_sub(then[1]) >> 20,
+        now[2].saturating_sub(then[2]) >> 20,
+        now[5].saturating_sub(then[5]),
+        now[3] >> 20,
+        then[3] >> 20,
+        now[4].saturating_sub(then[4]) >> 20,
+    )
+}
+
 /// Says [`removal_context`] in the log, once: called by whoever finds the
 /// host device removed.
 pub(crate) fn log_removal_context() {
@@ -345,6 +481,15 @@ pub(crate) fn log_removal_context() {
     }
     if trail_on() {
         tracing::error!("when the host device went: {}", removal_context());
+    }
+    // The memory at this moment: the memory line is up to five seconds
+    // old, and a card or a PC out of memory would not be in it.
+    tracing::error!("memory when the host device went: {}", removal_memory());
+    if let Some(host) = host() {
+        match host.video_memory_groups() {
+            Some(_) => host.log_video_memory("where the removal was found"),
+            None => tracing::error!("video memory where the removal was found: the system gives no numbers (the adapter does not answer)"),
+        }
     }
     // With device-removed data on (any form of `VICTORY_D3D12_DRED`): the
     // runtime's data too, unless a submission's own report has just asked
@@ -5824,6 +5969,7 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        self.video_memory_look();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.
@@ -8541,6 +8687,7 @@ impl Meter {
                 slow[1] as f64 / 1e3 / frames,
                 slow[2] as f64 / 1e3
             );
+            video_memory_line();
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
                 tracing::info!(
@@ -8762,7 +8909,16 @@ impl Host {
             if let Some((buffer, footprint)) = capture {
                 crate::capture::save_read_back(frame, &buffer, &footprint);
             }
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            // What Present answers was thrown away: a removal it is the
+            // first to report then looked as if the next call found it.
+            // Said once (a status that is no error, as "occluded", is not).
+            let shown = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            if shown.is_err() {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::error!("Present answered {:#010x} (said once): the first call to report it, frame {frame}", shown.0 as u32);
+                });
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));
@@ -8904,7 +9060,29 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
+        // For the line between the memory lines ([`video_memory_line`]).
+        VIDEO_PEAK[0].fetch_max(own.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[1].fetch_min(own.Budget, Ordering::Relaxed);
+        VIDEO_PEAK[2].fetch_max(shared.CurrentUsage, Ordering::Relaxed);
+        VIDEO_PEAK[3].fetch_add(1, Ordering::Relaxed);
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// One look at the card's memory of our own, at most every tenth of a
+    /// second, before a submission is prepared: for [`VIDEO_PEAK`], and so
+    /// that a change of the budget is said within a tenth of a second
+    /// ([`Self::video_memory`]). Two plain questions to the system.
+    fn video_memory_look(&self) {
+        if !video_look_on() {
+            return;
+        }
+        static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let now = now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now < last + 100 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        let _ = self.video_memory();
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
