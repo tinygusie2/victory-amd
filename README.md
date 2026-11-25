@@ -70,8 +70,12 @@ Tested on the machine above, first rooms, at like draw counts (runs 274 and 275)
   card is faster for it is not measured yet.
 - **Pull request #999 merged** (cxy0072019-sketch, porting a patch by Geckomacabre):
   `VICTORY_TEXTURE_BACK=1` copies textures of the ocean's kinds that shaders write back into title
-  memory, where the title's own code reads them. Off by default. Without it a boat sank here
-  (run 275); with it: not tried on this machine yet.
+  memory, where the title's own code reads them. Off by default. Without it a boat sank here and
+  its mission failed at once (run 275). With it (run 276, both shader caches wiped first): 22,900
+  read-backs landed in six minutes of play and the tester got past that point: the largest step
+  of the day. The same run then ended with the card lost (the driver logged two errors, then
+  "device removed", with nothing of the layer's running on the card at that moment). Why is not
+  known; run 275, the same set without this switch, played twenty minutes without an error.
 - **`VICTORY_BACK_READS=1|2|alt`** (diagnostics builds): counts who touches what the copy-back
   stored (the measuring step before any lazy copy-back). Not run yet.
 - The texture pass's time budget: never reached in the first rooms (about 5 ms a frame); 15 to
