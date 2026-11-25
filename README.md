@@ -48,8 +48,8 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 
 **Update, 2026-11-25 afternoon: what a frame is made of, measured, and two
 changes that hold.** First rooms, about 3,850 draws a frame: 104 ms a frame
-(9.6 frames a second) with the set below, from about 120 ms in the
-morning. Still far from the console's 33 ms.
+(9.6 frames a second) with the first two changes below, 97 ms (10.3)
+with all of them, from about 120 ms in the morning. Still far from the console's 33 ms.
 - How the title paces itself (new meters in `fence.rs` and
   `console_insn.rs`): it never asks for an event. Each frame begins with
   one small submission and a signal, and a title thread then waits for
@@ -83,6 +83,23 @@ morning. Still far from the console's 33 ms.
   windows on (960 are compute dispatches; about 1,000 are mesh records
   the title keeps scattered through a 100 MB argument buffer, which a
   window of records at one step cannot serve).
+- `VICTORY_INDIRECT_GATHER=1` (off by default): a single indirect record
+  that misses its window gets a slot in a scratch buffer of its list, and
+  the list's prelude clamps all such records in one pass by a table of
+  their offsets (the clamp shader with a gather bit), where each draw had
+  a compute pass of the layer's in front of it. Proved by clamping every
+  gathered record again at its draw and comparing on the card
+  (`VICTORY_INDIRECT_WINDOW_CHECK=1`): 7.9 million records, none differed.
+  About 600 of the ~1,600 draws that missed a window are served; the
+  others come after a dispatch or a storing draw in their list. With
+  `VICTORY_CARD_REHASH_RUNS=1`: 104 -> 97 ms a frame (10.3 frames a
+  second at 3,800 draws).
+- What the card's time is now, added up: of ~87 ms busy in a 97 ms
+  frame, the layer's own lists are ~19 ms and its clamp passes 10-20 ms;
+  about 50 ms are the title's own ~30 compute passes and its geometry at
+  2560x1440 as translated. With every pass of the layer's gone, this
+  scene would still be near 20 frames a second on this card: the
+  translated shaders have to get cheaper too.
 - Measured and found to give nothing (switches left in, off):
   `VICTORY_REFRESH_ONCE`, `VICTORY_ASYNC_PRESENT`, `VICTORY_VIEW_KNOWN`,
   `VICTORY_SPREAD`, `VICTORY_QUEUE2=3`, `VICTORY_WINDOW_JUMP`. Each has an
