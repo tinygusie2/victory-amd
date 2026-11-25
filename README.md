@@ -79,10 +79,45 @@ What did it, on top of the list below:
   0 here, but the card got busier, so no gain is claimed yet). The frame is
   still 250 to 380 ms: the card is the limit now, most of it the
   per-record clamp before each of some 6,700 indirect draws a frame.
-- Tried and NOT in this tree: pull request #220 (cheaper indirect draws)
-  with `VICTORY_INDIRECT_WINDOW=1` cut the card's time from about 100-150
-  to 35-80 ms a frame here, and lost the device twice (once with a page
-  fault on the card after 160 s). Do not turn windows on with it yet.
+- Pull request #220 (cheaper indirect draws) is IN this tree now, its
+  windows off by default (`VICTORY_INDIRECT_WINDOW=1`). History, so nobody
+  repeats it: with windows on it lost the device three times here. Its own
+  checker (`VICTORY_INDIRECT_WINDOW_CHECK=1`) then showed one list drawing
+  90 records of 2^24 vertices from a window, where the per-draw path lets
+  eight through; a record of 2^23 vertices an instance or more now runs
+  empty. Since that fix: five runs with windows on, no device loss, the
+  card's time per frame roughly halved. One loss after the fix had the
+  in-flight fetch (#648) on as well; do not combine the two. The in-flight
+  fetch itself measured slower here in two runs and stays off.
+- Frame rate, second night (an RTX 4070; the first room went from about
+  3.5-4 to 6-7 frames a second with ALL of the switches below; the
+  defaults are unchanged and give about 4.5-5):
+  - `VICTORY_ASYNC_SUBMIT=1`: submissions are prepared and sent by a
+    thread of the layer, not by the title's render thread, which a
+    profile showed inside the submit path for 257 of 292 ms a frame.
+  - `VICTORY_QUEUE2=1`: fetches of what shaders wrote go to a copy queue
+    (brought back, with the fix for a piece fetched beside a later
+    flight); the copy-back thread's wait fell from about 125 to 7 ms a
+    frame.
+  - `VICTORY_INDIRECT_WINDOW=1`: see above.
+  - `VICTORY_TEXTURE_NO_WAIT=1`: a texture refresh no longer waits while
+    the title remaps memory; the loading phase had 5 readings over a
+    second where it had 18.
+  - `VICTORY_MERGE_GAP=64 VICTORY_MERGE_RUNS=4096`: title bytes put in
+    under flights' shader writes are joined over small gaps (NOT exact:
+    read the comment at `merge_gap` before using it).
+  - On by default: fills of upload memory and read-only buffer copies no
+    longer wait for flights and are checked against what the flights then
+    wrote (`VICTORY_FILL_WAIT=1` waits as before; no mismatch in any run
+    so far); up to 512 idle host lists and texture staging buffers are
+    reused instead of made and freed every frame.
+  - `VICTORY_PROFILE=1` (diagnostics builds): a sampling profiler inside
+    the layer; it is how the above was found.
+  Still open: the frame rate dips (5-second readings of 300-500 ms among
+  150-215); in some of them texture uploads are 3-5 times the usual, in
+  others nothing logged stands out. Not shader compiles (checked: 4-9
+  first uses and no waiting in those readings). A per-frame logger is the
+  next step.
 - Known and counted, not fixed yet: an indirect compute pass asks for
   about 77,500 thread groups in x where one dispatch runs 65,535 (the
   rest is cut off).
