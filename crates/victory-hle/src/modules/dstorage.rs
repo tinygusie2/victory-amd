@@ -517,6 +517,13 @@ impl Lanes {
         *requests += 1;
         *bytes += u64::from(job.request.destination_size);
         *busy += started.elapsed();
+        #[cfg(windows)]
+        {
+            use victory_gpu::framelog::{T, add};
+            add(T::DiskReads, 1);
+            add(T::DiskBytes, u64::from(job.request.destination_size));
+            add(T::DiskUs, started.elapsed().as_micros() as u64);
+        }
         if job.request.options & BCPACK != 0 {
             self.bcpack.0 += u64::from(job.request.destination_size);
             self.bcpack.1 += started.elapsed();
