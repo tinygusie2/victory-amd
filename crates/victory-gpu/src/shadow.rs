@@ -1747,22 +1747,6 @@ pub(crate) fn merged_stats() -> [u64; 3] {
     [0, 1, 2].map(|i| MERGED[i].swap(0, Ordering::Relaxed))
 }
 
-/// `runs` (in order) with those a gap of `gap` bytes or fewer apart made
-/// one run, the gap's bytes included.
-fn joined_over(runs: Vec<(usize, usize)>, gap: usize) -> Vec<(usize, usize)> {
-    if gap == 0 || runs.len() < 2 {
-        return runs;
-    }
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(runs.len());
-    for (at, n) in runs {
-        match out.last_mut() {
-            Some(last) if at - (last.0 + last.1) <= gap => last.1 = at + n - last.0,
-            _ => out.push((at, n)),
-        }
-    }
-    out
-}
-
 /// The gap, in bytes, over which the title bytes put into a copy in the
 /// card's memory under flights' shader writes are joined into one run
 /// (`VICTORY_MERGE_GAP`, 0 to 64; 0 by default: only the bytes the title
@@ -1787,12 +1771,19 @@ fn merge_gap() -> usize {
     *GAP.get_or_init(|| std::env::var("VICTORY_MERGE_GAP").ok().and_then(|v| v.trim().parse::<usize>().ok()).map_or(0, |n| n.min(64)))
 }
 
-/// The runs of bytes where `now` differs from `was` (of one length), as
-/// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
+/// The exact runs of changed bytes, for tests of the merge rules.
+#[cfg(test)]
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
-    let n = now.len().min(was.len());
     let mut runs = Vec::new();
+    find_changed_runs(now, was, 0, &mut runs);
+    runs
+}
+
+/// Reuse the same run buffer across pages. A nonzero `gap` includes the
+/// unchanged bytes between runs at most that far apart.
+fn find_changed_runs(now: &[u8], was: &[u8], gap: usize, runs: &mut Vec<(usize, usize)>) {
+    runs.clear();
+    let n = now.len().min(was.len());
     let mut i = 0;
     while i < n {
         // Equal bytes, eight at a time while they last.
@@ -1809,14 +1800,20 @@ fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
         while i < n && now[i] != was[i] {
             i += 1;
         }
-        runs.push((first, i - first));
+        if gap != 0
+            && let Some(last) = runs.last_mut()
+            && first - (last.0 + last.1) <= gap
+        {
+            last.1 = i - last.0;
+        } else {
+            runs.push((first, i - first));
+        }
     }
-    runs
 }
 
 #[cfg(test)]
 mod merge_tests {
-    use super::{PIECE, back_piece, changed_runs};
+    use super::{PIECE, back_piece, changed_runs, find_changed_runs};
 
     /// A piece put back takes the GPU's bytes where the copy changed and
     /// the title's everywhere else, reads and writes title memory only from
@@ -1928,6 +1925,22 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    #[test]
+    fn reused_runs_keep_exact_and_joined_pages_separate() {
+        let was = [0; 24];
+        let mut now = was;
+        for at in [6, 8, 9, 11, 16, 17, 23] {
+            now[at] = 1;
+        }
+        let mut runs = vec![(99, 99)];
+        find_changed_runs(&now, &was, 1, &mut runs);
+        assert_eq!(runs, [(6, 6), (16, 2), (23, 1)]);
+        find_changed_runs(&now, &was, 0, &mut runs);
+        assert_eq!(runs, [(6, 1), (8, 2), (11, 1), (16, 2), (23, 1)]);
+        find_changed_runs(&was, &was, 1, &mut runs);
+        assert!(runs.is_empty());
     }
 }
 
@@ -2891,6 +2904,7 @@ impl Shadow {
         }
         let base = start / PAGE;
         let mut title = vec![0u8; PAGE];
+        let mut runs = Vec::new();
         for (a, e) in busy {
             // As the refresh itself asks (`update_free`): the journal if
             // the submission's asking covered the range, else the kernel,
@@ -2928,20 +2942,20 @@ impl Shadow {
                 }
                 MERGED[0].fetch_add(1, Ordering::Relaxed);
                 let at = lo - start;
+                let mut merged_bytes = 0;
                 if self.card.is_some() {
                     // SAFETY: inside the mapping of the copy's CPU side,
                     // which only the submitting thread writes.
                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                    let runs = joined_over(changed_runs(title, held), merge_gap());
+                    find_changed_runs(title, held, merge_gap(), &mut runs);
                     if runs.len() > *runs_left {
                         return true;
                     }
                     *runs_left -= runs.len();
-                    for (r, m) in runs {
+                    for &(r, m) in &runs {
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
                         self.card_changed(at + r, at + r + m);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        merged_bytes += m;
                     }
                 } else {
                     let Some(snapshot) = before.as_mut() else {
@@ -2951,17 +2965,21 @@ impl Shadow {
                     // bytes at the copy's offsets (`writing`), and these
                     // are in a declared range.
                     let held = unsafe { std::slice::from_raw_parts_mut(snapshot.as_mut_ptr().add(at), n) };
-                    for (r, m) in changed_runs(title, held) {
+                    find_changed_runs(title, held, 0, &mut runs);
+                    for &(r, m) in &runs {
                         // SAFETY: inside the copy's mapping. The card may be
                         // writing the copy beside these bytes; they are
                         // written here and nothing around them.
                         unsafe { std::ptr::copy_nonoverlapping(title.as_ptr().add(r), self.data.add(at + r), m) };
                         held[r..r + m].copy_from_slice(&title[r..r + m]);
-                        MERGED[1].fetch_add(1, Ordering::Relaxed);
-                        MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
+                        merged_bytes += m;
                     }
                 }
                 drop(before);
+                if !runs.is_empty() {
+                    MERGED[1].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                    MERGED[2].fetch_add(merged_bytes as u64, Ordering::Relaxed);
+                }
                 // Taken, if the range holds all of the page that is in the
                 // copy; else the rest of it is the refresh's, which notes
                 // only whole pages, and the page is looked at again.
