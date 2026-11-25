@@ -521,6 +521,107 @@ mod card_tests {
         }
     }
 
+    /// The fetch inside flights (`CARD_FETCH` in host.rs) copies each piece
+    /// from `inflight_piece_from` on: what the merge takes of the piece lies
+    /// in that slot.
+    #[test]
+    fn a_piece_fetched_in_flight_fits_its_slot() {
+        let slot = crate::host::INFLIGHT_SLOT as usize;
+        for start in [0usize, 4096, 7, PIECE - 16, PIECE - 3, 3 * PIECE + 0x1f09, 0xd_b790_df00] {
+            let len = 5 * PIECE + 4096;
+            for (from, to) in [(0, len), (0, 1), (16, PIECE), (PIECE - 4, PIECE + 4), (2 * PIECE, len), (12345, 4 * PIECE + 7)] {
+                let span = card_span_of(start, from, to);
+                for i in 0..span.pieces {
+                    let (lo, hi) = card_piece_of(start, len, &span, i);
+                    let at = crate::host::inflight_piece_from(&span, i);
+                    assert_eq!(at % 16, 0);
+                    assert!(lo >= at && hi - at <= slot, "{start:#x} {from} {to} piece {i}: {lo}..{hi} from {at}");
+                }
+            }
+        }
+    }
+
+    /// The slots are a power of two, one per 64 KiB asked, within the
+    /// shader's 32-bit offsets.
+    #[test]
+    fn inflight_slots_are_a_power_of_two() {
+        use crate::host::{INFLIGHT_SLOT, inflight_slots};
+        assert_eq!(inflight_slots(64 << 20), 1024);
+        assert_eq!(inflight_slots(100 << 20), 1024);
+        assert_eq!(inflight_slots(1), 1);
+        assert_eq!(inflight_slots(1 << 20), 16);
+        let most = inflight_slots(u64::MAX);
+        assert!(most.is_power_of_two() && u64::from(most) * INFLIGHT_SLOT <= 1 << 32);
+    }
+
+    /// Tickets drawn and landed in order, the mark raised as the landing
+    /// raises it (every ticket a landed flight drew), through the counter's
+    /// wrap with the slots the default gives: no two tickets in the air
+    /// that got a slot share one, slots are still given after the wrap, and
+    /// the mark follows the counter.
+    #[test]
+    fn inflight_tickets_never_share_a_slot_across_the_wrap() {
+        use crate::host::{inflight_gets_slot, inflight_raise, inflight_slots};
+        let slots = inflight_slots(64 << 20);
+        let mut landed = u32::MAX - 3000;
+        let mut next = landed;
+        // Flights of 1 to 700 flagged pieces, up to three in the air:
+        // (tickets drawn, those that got a slot).
+        let mut air: std::collections::VecDeque<(Vec<u32>, Vec<u32>)> = Default::default();
+        let mut after_wrap = 0;
+        for flight in 0..40u32 {
+            let drawn: Vec<u32> = (0..1 + flight * 37 % 700).map(|i| next.wrapping_add(i)).collect();
+            next = next.wrapping_add(drawn.len() as u32);
+            let slotted: Vec<u32> = drawn.iter().copied().filter(|&k| inflight_gets_slot(k, landed, slots)).collect();
+            after_wrap += slotted.iter().filter(|&&k| k < 1 << 20).count();
+            air.push_back((drawn, slotted));
+            let mut used: Vec<u32> = air.iter().flat_map(|a| a.1.iter()).map(|k| k % slots).collect();
+            let n = used.len();
+            used.sort_unstable();
+            used.dedup();
+            assert_eq!(used.len(), n, "flight {flight}: two tickets in the air share a slot");
+            if air.len() == 3
+                && let Some((drawn, _)) = air.pop_front()
+            {
+                for k in drawn {
+                    landed = inflight_raise(landed, k);
+                }
+            }
+        }
+        while let Some((drawn, _)) = air.pop_front() {
+            for k in drawn {
+                landed = inflight_raise(landed, k);
+            }
+        }
+        assert!(next < 1 << 20, "the counter wrapped");
+        assert!(after_wrap > 0, "slots after the wrap");
+        assert_eq!(landed, next);
+        // Raised in wrapping order, never back.
+        assert_eq!(inflight_raise(u32::MAX - 1, u32::MAX), 0);
+        assert_eq!(inflight_raise(5, 2), 5);
+        assert_eq!(inflight_raise(u32::MAX - 1, 3), 4);
+        assert!(!inflight_gets_slot(3, 4, 8));
+    }
+
+    /// Flights 5, 6, 7 in the air with the fetch inside flights: 5 lands
+    /// the old way with the queue's count at 7. The title's byte that went
+    /// up in send 7 must still be told apart when 6 lands from its slot
+    /// (its merge leaves out sends after 6), so send 7's note must outlive
+    /// the mark (`card_dirty` keeps notes above it, `card_merge_relay`
+    /// leaves out those above its "fetched after").
+    #[test]
+    fn a_fetch_the_old_way_keeps_the_notes_flights_in_the_air_need() {
+        use crate::host::fallback_fetched_mark;
+        let notes = [5u64, 6, 7];
+        let mark = fallback_fetched_mark(true, 7, Some(5));
+        let kept: Vec<u64> = notes.iter().copied().filter(|&s| s > mark).collect();
+        assert!(kept.iter().any(|&s| s > 6), "send 7's note was dropped before flight 6 merged");
+        assert_eq!(mark, 5);
+        // Without the switch every later merge fetches after 7: as before.
+        assert_eq!(fallback_fetched_mark(false, 7, Some(5)), 7);
+        assert_eq!(fallback_fetched_mark(true, 7, None), 0);
+    }
+
     /// Changed ranges are joined where they overlap or touch, and only there.
     #[test]
     fn ranges_join_where_they_touch() {
@@ -649,7 +750,7 @@ fn merge_piece(now: &[u8], held: &mut [u8], title: &mut [u8]) -> bool {
 }
 
 /// `[from, to)` without the ranges of `skip`, in order.
-fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+pub(crate) fn outside(from: usize, to: usize, mut skip: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     skip.sort_unstable();
     let mut out = Vec::new();
     let mut at = from;
@@ -3765,6 +3866,103 @@ mod window_tests {
             assert!(start <= address && start + len >= end);
             assert!(start % g == 0 && len % g == 0);
         }
+    }
+}
+
+#[cfg(test)]
+mod card_merge_tests {
+    use super::{Card, Shadow};
+    use std::sync::Mutex;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::*;
+
+    /// A plain buffer on the software adapter: what a copy's `buffer` and
+    /// its card's `staging` are; the merge never touches them.
+    fn warp_buffer() -> Option<ID3D12Resource> {
+        // SAFETY: plain DXGI and D3D12 creation calls on the software adapter.
+        unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().ok()?;
+            let mut device: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut device).ok()?;
+            let device = device?;
+            let heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_DEFAULT,
+                ..Default::default()
+            };
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 64 << 10,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .ok()?;
+            buffer
+        }
+    }
+
+    /// The mixed landing the fetch inside flights must survive, on a real
+    /// copy in the card's memory and its merge (`Shadow::card_merge_relay`):
+    /// flights 5, 6, 7 in the air; 5 lands the old way with the queue's
+    /// count at 7; the title wrote a byte that went up in send 7 into a
+    /// piece flight 6's shaders write; 6 then lands from its own slot, which
+    /// holds that byte as it was before send 7. The notes of sends are
+    /// dropped as `card_dirty` drops them, below the mark the old-way fetch
+    /// sets (`crate::host::fallback_fetched_mark`): with the mark at the
+    /// landed plans' send the title's byte survives and the shader's write
+    /// lands; with the mark at the fetch's count (as before the fix) the
+    /// title's byte is put back to the card's older one.
+    #[test]
+    fn a_title_byte_sent_after_a_flight_survives_its_slot() {
+        let (Some(buffer), Some(staging)) = (warp_buffer(), warp_buffer()) else {
+            return;
+        };
+        const LEN: usize = 64 << 10;
+        let (title_byte, shader_byte) = (100usize, 200usize);
+        let content: Vec<u8> = (0..LEN).map(|i| (i * 7 + 3) as u8).collect();
+        let land = |mark: u64| -> Vec<u8> {
+            let mut title = content.clone();
+            let mut side = content.clone();
+            // The title's byte, refreshed into the CPU's side and sent up in send 7.
+            title[title_byte] ^= 0x5a;
+            side[title_byte] = title[title_byte];
+            let mut shadow = Shadow::new(buffer.clone(), side.as_mut_ptr(), 0, title.as_ptr() as u64, LEN as u64);
+            shadow.card = Some(Card {
+                staging: staging.clone(),
+                before: Mutex::new(None),
+                dirty: Mutex::default(),
+                sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                // 0: no card bytes counted (`Drop` takes them off again).
+                size: 0,
+            });
+            // As `card_dirty` with the mark set by the old-way fetch.
+            if let Some(card) = &shadow.card {
+                card.sent.lock().unwrap().retain(|s| s.2 > mark);
+            }
+            // Flight 6's slot: the card's bytes behind its lists, before send 7.
+            let mut slot = content.clone();
+            slot[shader_byte] ^= 0xc3;
+            let written = shadow.card_merge_relay(0, &slot, 6, &mut Vec::new());
+            assert!(written > 0);
+            drop(shadow);
+            title
+        };
+        let fixed = land(crate::host::fallback_fetched_mark(true, 7, Some(5)));
+        assert_eq!(fixed[title_byte], content[title_byte] ^ 0x5a, "the title's byte was lost");
+        assert_eq!(fixed[shader_byte], content[shader_byte] ^ 0xc3, "the shader's write did not land");
+        // The mark at the fetch's count: the note of send 7 is gone and the
+        // older card byte is taken for a shader's write.
+        let before = land(7);
+        assert_eq!(before[title_byte], content[title_byte]);
     }
 }
 
