@@ -7410,7 +7410,7 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -7745,6 +7745,63 @@ impl Batch {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Whether a list's fills of under 256 bytes are copied in place
+/// (`VICTORY_FILLS_PLAIN=1`, with `VICTORY_COPY_PLAIN=1`; off by default:
+/// through the kernel's copy, as before). `alt`: twenty seconds with,
+/// twenty without, in turn, each change said in the log.
+///
+/// A fill copies constants the title recorded a draw with into upload
+/// memory of the list's own. `crate::plaincopy` leaves copies that short
+/// to the kernel because the layer's ASKINGS are that short and fail; the
+/// fills are there, and each was a system call
+/// (`crate::plaincopy::copy_short`). The same bytes, read at the same
+/// step; a source page that is gone goes to the kernel's copy as before.
+fn fills_plain() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_FILLS_PLAIN").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list's fills of under 256 bytes are copied in place from now (VICTORY_FILLS_PLAIN=alt): {}",
+                    if on { "ON" } else { "off, through the kernel's copy as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// A fill's copy ([`Step::Fill`]): title memory at `src` into upload memory
+/// at `dst`. In place if it is short and [`fills_plain`] says so, else (and
+/// if a source page was not there) as every copy ([`copy_mapped`]).
+fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    #[cfg(feature = "diagnostics")]
+    let timing_only = crate::copystat::mode() != 0;
+    #[cfg(not(feature = "diagnostics"))]
+    let timing_only = false;
+    if len > 0
+        && len < crate::plaincopy::least()
+        && !timing_only
+        && fills_plain()
+        && crate::plaincopy::copy_short(dst, src, len)
+    {
+        #[cfg(feature = "diagnostics")]
+        crate::backreads::touched(src as usize, len, false);
+        return;
+    }
+    copy_mapped(dst, src, len, false);
 }
 
 /// Copies title memory at submission. The ranges were checked against their
