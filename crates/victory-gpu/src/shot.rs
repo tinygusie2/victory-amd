@@ -97,7 +97,19 @@ static SUBMITTED: AtomicU32 = AtomicU32::new(0);
 
 /// Whether the title has begun to submit the frame being recorded.
 fn closing() -> bool {
-    SUBMITTED.load(Relaxed) >= FRAME_LISTS
+    SUBMITTED.load(Relaxed) >= frame_lists()
+}
+
+/// [`FRAME_LISTS`], or `VICTORY_SHOT_LISTS` if set. The title may go on
+/// beginning lists of a frame long after its first twenty are submitted:
+/// shot-1785-012256 (run 287) had 34 lists submitted before the frame's
+/// lighting lists were begun, took those for the next frame's and holds
+/// none of their commands. A number no frame reaches keeps every list
+/// begun until the shot's last present (three presents at most): more
+/// than one frame, with nothing of it left out.
+fn frame_lists() -> u32 {
+    static LISTS: OnceLock<u32> = OnceLock::new();
+    *LISTS.get_or_init(|| number("VICTORY_SHOT_LISTS", u64::from(FRAME_LISTS)).min(u64::from(u32::MAX)) as u32)
 }
 
 /// The title submits `list`, while a shot records.
