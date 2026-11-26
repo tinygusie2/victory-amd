@@ -1721,6 +1721,12 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        if let (None, Some(h), true) = (sub, h, n > 1 && Self::wide_loads()) {
+            for (k, x) in self.raw_dwords(h, off, n).into_iter().enumerate() {
+                self.write(inst, Reg::V(reg + k as u8), x, guard);
+            }
+            return Ok(());
+        }
         for k in 0..n {
             let x = match sub {
                 None => {
@@ -2218,6 +2224,18 @@ impl<'a> Lower<'a> {
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
+        // A compute program that reads its group id x may run spread across
+        // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
+        // stages, near the root signature's 64 dwords), nor one whose first
+        // block is a loop header (its counter sits in the entry block).
+        if self.x.native.stage == HwStage::Cs
+            && self.user_first() == 0
+            && !self.counters.contains_key(&order[0])
+            && self.x.io.inputs.iter().any(|&(_, i)| i == Input::GroupId(0))
+        {
+            self.cs_spread_prologue();
+            self.block[order[0]] = Some(self.cur);
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -2427,6 +2445,50 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// A dispatch the host spread across z (`USER_DISPATCH_SPREAD`): the
+    /// group id as the title asked it, `(x + z * row, y, 0)`, for every input
+    /// that reads it, and the groups past the asked count leave before the
+    /// body (whole groups: no barrier is split). `row` 0: as dispatched.
+    /// The entry block ends here; the first block's code goes to the next.
+    /// (After upstream VIctory pull request #2312.)
+    fn cs_spread_prologue(&mut self) {
+        use super::shader::USER_DISPATCH_SPREAD;
+        let row = self.host_word(RootType::Other(USER_DISPATCH_SPREAD), 0, 0);
+        let asked = self.host_word(RootType::Other(USER_DISPATCH_SPREAD), 0, 1);
+        let Val::I32(gx) = self.compute_id("groupId.i32", 94, 0) else {
+            unreachable!()
+        };
+        let Val::I32(gz) = self.compute_id("groupId.i32", 94, 2) else {
+            unreachable!()
+        };
+        let e = self.s.entry;
+        let zero = self.s.m.i32(0);
+        let unspread = self.s.m.cmp(e, pred::EQ, row, zero);
+        let mul = self.s.m.bin(e, Bin::Mul, gz, row);
+        let spread_x = self.s.m.bin(e, Bin::Add, gx, mul);
+        let eff_x = self.s.m.select(e, unspread, gx, spread_x);
+        let eff_z = self.s.m.select(e, unspread, gz, zero);
+        let in_x = self.s.m.cmp(e, pred::IULT, eff_x, asked);
+        let keep = self.s.m.bin(e, Bin::Or, unspread, in_x);
+        let io_inputs: HashMap<Value, Input> = self.x.io.inputs.iter().copied().collect();
+        for (&v, &inp) in &io_inputs {
+            match inp {
+                Input::GroupId(0) => {
+                    self.vals.insert(v, Val::I32(eff_x));
+                }
+                Input::GroupId(2) => {
+                    self.vals.insert(v, Val::I32(eff_z));
+                }
+                _ => {}
+            }
+        }
+        let body = self.s.m.new_block();
+        let ret = self.s.m.new_block();
+        self.s.m.terminate(ret, Term::Ret);
+        self.s.m.terminate(e, Term::CondBr(keep, body, ret));
+        self.cur = body;
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(
@@ -3543,6 +3605,36 @@ impl<'a> Lower<'a> {
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
+    }
+
+    /// Flushes f32 subnormals to signed zero, keeping all other values and
+    /// the sign of zero intact.
+    fn ftz(&mut self, x: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(x);
+        let exp_mask = self.s.m.i32(0x7F80_0000);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let exp = self.s.m.bin(c, Bin::And, bits, exp_mask);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, zero);
+        let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = self.s.m.select(c, sub, signed_zero, bits);
+        self.as_float(flushed)
+    }
+
+    /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
+    /// with the legacy rule that a zero factor makes the product a +0 rather
+    /// than turning an infinite or NaN factor into a NaN.
+    fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let fused = self.fmad(a, b, c);
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
+        let z = self.s.m.bin(cur, Bin::Or, az, bz);
+        // +0 + c, so the sign of a zero addend follows the addition.
+        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+        self.s.m.select(cur, z, addend, fused)
     }
 
     // ---- lane booleans ----
@@ -5457,6 +5549,47 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Whether the dwords of one console load are read by one call for up
+    /// to four of them (`bitcode::opt::WIDE` of `VICTORY_SHADER_OPT`), not
+    /// by a call each.
+    fn wide_loads() -> bool {
+        super::shader_opt() & super::bitcode::opt::WIDE != 0
+    }
+
+    /// `count` dwords from byte `addr` on of the raw view `h`, as integers,
+    /// read in the current block by one call for every four of them
+    /// ([`Self::wide_loads`]). They are the dwords of ONE console load,
+    /// which the console reads as one (address plus 4, 8, ... without
+    /// wrapping at 32 bits): the same bytes as a call a dword reads. Loads
+    /// of different console instructions are never joined: the program
+    /// computes their offsets in 32-bit registers, and `x - 4` and `x` at
+    /// `x = 0` are one dword out of the view and its first one, where one
+    /// call from `x - 4` on would read both out of it.
+    fn raw_dwords(&mut self, h: V, addr: V, count: u32) -> Vec<V> {
+        let c = self.cur;
+        let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+        let mut out = Vec::with_capacity(count as usize);
+        for first in (0..count).step_by(4) {
+            let n = (count - first).min(4);
+            let off = self.s.m.i32(4 * first);
+            let a = self.s.m.bin(c, Bin::Add, addr, off);
+            let mask = self.s.m.i8((1u8 << n) - 1);
+            let r = self.s.op(
+                c,
+                "rawBufferLoad.f32",
+                Attr::ReadOnly,
+                self.s.t.res_ret,
+                139,
+                &[h, a, u, mask, al],
+            );
+            for k in 0..n {
+                let x = self.s.m.extract(c, r, k);
+                out.push(self.as_int(x));
+            }
+        }
+        out
+    }
+
     fn smem(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
         let Fields::Smem {
             data,
@@ -5538,7 +5671,12 @@ impl<'a> Lower<'a> {
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
-            for k in 0..count {
+            let wide = Self::wide_loads();
+            if wide {
+                let dwords = self.raw_dwords(h, addr, count);
+                raw.extend(dwords.into_iter().map(|x| (x, zero)));
+            }
+            for k in 0..if wide { 0 } else { count } {
                 let b = self.cur;
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(b, Bin::Add, addr, off);
@@ -5576,6 +5714,12 @@ impl<'a> Lower<'a> {
         }
         if matches!(kind, Some(u) if u.kind == ResourceType::Srv) {
             let h = self.handle(site, src, false, (11, 0))?;
+            if Self::wide_loads() {
+                for (k, x) in self.raw_dwords(h, addr, count).into_iter().enumerate() {
+                    self.write(inst, Reg::S(code + k as u8), x, None);
+                }
+                return Ok(());
+            }
             for k in 0..count {
                 let off = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, addr, off);
@@ -7175,21 +7319,26 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
+                    // On RDNA 2 the legacy encoding decodes as fused
+                    // (`v_fma_legacy_f32`) and flushes its sources; the
+                    // zero-factor rule of the legacy multiply comes with it.
                     _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
+                        self.legacy_fmad(a, bb, acc)
                     }
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
+                float(self, r)
+            }
+            "v_mad_legacy_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {

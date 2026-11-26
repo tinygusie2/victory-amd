@@ -263,6 +263,15 @@ fn submit_cut(this: This, lists: &[This]) {
     } else {
         0
     };
+    // A frame shot learns that its frame's lists are being submitted.
+    #[cfg(feature = "diagnostics")]
+    if crate::shot::recording() {
+        for &l in lists {
+            if let Some(h) = crate::list::host_list(l) {
+                crate::shot::submitted(h);
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -344,6 +353,15 @@ fn submit_split(this: This, lists: &[This]) {
     } else {
         0
     };
+    // A frame shot learns that its frame's lists are being submitted.
+    #[cfg(feature = "diagnostics")]
+    if crate::shot::recording() {
+        for &l in lists {
+            if let Some(h) = crate::list::host_list(l) {
+                crate::shot::submitted(h);
+            }
+        }
+    }
     #[cfg(feature = "diagnostics")]
     crate::capture::op(this as usize, || {
         let named: Vec<String> = lists
@@ -669,7 +687,7 @@ fn send_joined(joined: &mut Joined) {
         let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
         JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
         JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
-        if sent % 2048 == 0 {
+        if sent.is_multiple_of(2048) {
             let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
             tracing::info!(
                 "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
@@ -1365,6 +1383,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     #[cfg(all(windows, feature = "diagnostics"))]
     {
         crate::capture::frame_drew(frame, crate::draw::drawn());
+        crate::renderdoc::frame_drew(frame, crate::draw::drawn());
+        crate::shot::present(frame, crate::draw::drawn());
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }

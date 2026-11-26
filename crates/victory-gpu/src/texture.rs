@@ -102,10 +102,16 @@ pub(crate) static SPARE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std:
 /// dip. Buffers of up to 8 MiB are now kept by size and used again,
 /// zeroed as a new one is (levels not there yet must read as zeros).
 /// `VICTORY_STAGING_POOL=0`: made and freed each time, as before.
+/// `VICTORY_STAGING_POOL=alt`: twenty seconds with the pool, twenty
+/// without, in turn, each change said in the log: a buffer made without
+/// is freed as before, and the spare ones wait for the next turn.
+/// `VICTORY_STAGING_POOL_MB`: the most kept spare (256 unless said).
 fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resource, *mut u8, u64)> {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let size = total.max(64 << 10).next_power_of_two();
-    if size > SPARE_MOST.1 || !*ON.get_or_init(|| std::env::var_os("VICTORY_STAGING_POOL").is_none_or(|v| v != "0")) {
+    if size > SPARE_MOST.1 || !staging_pool() {
+        // (Counted as made: the frame log's "staging N made" is then the
+        // buffers of a run without the pool too.)
+        SPARE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return host.upload_buffer(total).map(|(buffer, data)| (buffer, data, 0));
     }
     let spare = {
@@ -127,6 +133,41 @@ fn staging_buffer(host: &crate::host::Host, total: u64) -> Option<(ID3D12Resourc
     host.upload_buffer(size).map(|(buffer, data)| (buffer, data, size))
 }
 
+/// Whether staging buffers are taken from and returned to the spare ones
+/// now (`VICTORY_STAGING_POOL`).
+fn staging_pool() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_STAGING_POOL").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "texture staging buffers are taken from the spare ones from now (VICTORY_STAGING_POOL=alt): {}",
+                    if on { "ON" } else { "off, made and freed each time" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The most bytes of staging buffers kept spare (`VICTORY_STAGING_POOL_MB`).
+fn spare_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_STAGING_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(SPARE_MOST.0, |mb| mb << 20)
+    })
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
@@ -135,6 +176,9 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// The frame it was read in ahead of its submission
+    /// ([`Staging::refresh_ahead`]).
+    ahead: Option<u64>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -276,7 +320,10 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             }
         }
     };
-    let first = list.first_use(placed as usize);
+    // An upload from title memory can have already used this view. Only
+    // a copy from the same GPU source can satisfy this read.
+    list.first_use(placed as usize);
+    let new_source = list.alias_source_changed(to, from);
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
@@ -291,7 +338,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
-    if !first && before.is_none() {
+    if !new_source && before.is_none() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -465,7 +512,7 @@ impl Drop for Staging {
         // reset, after their submission has run): its buffer is spare.
         if self.pooled != 0 {
             let mut all = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-            if all.1 + self.pooled <= SPARE_MOST.0 {
+            if all.1 + self.pooled <= spare_most() {
                 all.1 += self.pooled;
                 all.0.entry(self.pooled).or_default().push(Spare(self.buffer.clone(), self.data as usize));
             }
@@ -1023,7 +1070,9 @@ impl Staging {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+            let frame = crate::frame::current();
+            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY)
+                && last.ahead.is_none_or(|at| frame > at + 1);
             if unwritten && !turn {
                 return 0;
             }
@@ -1109,6 +1158,36 @@ impl Staging {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         size
+    }
+
+    /// Detiles the texture memory into the staging buffer ahead of the
+    /// submission, on the thread of `crate::heap_worker`: read through the
+    /// kernel, so that the runtime's remapping never waits for it, whole or
+    /// not at all (the submission then does it, as ever). False if it was
+    /// not read. What the title writes after this is found at submission.
+    pub(crate) fn refresh_ahead(&self) -> bool {
+        let size = self.layout.size as usize;
+        let start = self.memory as usize;
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        let last = &mut *last;
+        if last.hash.is_some() || last.asked != 0 {
+            // Detiled before: the submission's check is cheap.
+            return true;
+        }
+        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let Some((now, _)) = asked else {
+            return false;
+        };
+        with_read(size, |read| {
+            if !crate::host::read_into(self.memory, read) {
+                return false;
+            }
+            last.hash = Some(blake3::hash(read));
+            self.detile(read);
+            last.asked = now;
+            last.ahead = Some(crate::frame::current());
+            true
+        })
     }
 
     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
@@ -1468,7 +1547,7 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
     }
     let (buffer, data, pooled) = staging_buffer(host, total)?;
-    crate::host::name(&buffer, || {
+    crate::host::name_frame(&buffer, || {
         format!(
             "staging of {resource:?} {}x{}x{} f{}",
             d.Width, d.Height, d.DepthOrArraySize, d.Format.0
