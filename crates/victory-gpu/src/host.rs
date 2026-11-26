@@ -6598,15 +6598,21 @@ impl Host {
         }
     }
 
-    /// Whether the host device is a software adapter (WARP: the checks'
-    /// machine has no card, and tests of what only a card does skip there).
+    /// Whether the host device is a software adapter, or cannot be told to
+    /// be a card (WARP: the checks' machine has no card, and tests of what
+    /// only a card does skip there). Told by the adapter's flag or by its
+    /// maker: Microsoft's (0x1414) is the software one under whatever name
+    /// and flags a machine without a card gives it (the flag alone did not
+    /// say so on the checks' machine); an adapter that does not answer
+    /// counts as software too.
     #[cfg(test)]
     pub(crate) fn software(&self) -> bool {
+        const MICROSOFT: u32 = 0x1414;
         // SAFETY: a plain query.
-        self.adapter
-            .as_ref()
-            .and_then(|a| unsafe { a.GetDesc1() }.ok())
-            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+        match self.adapter.as_ref().and_then(|a| unsafe { a.GetDesc1() }.ok()) {
+            Some(d) => d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || d.VendorId == MICROSOFT,
+            None => true,
+        }
     }
 
     /// The host device (`crate::cardmeter`).
