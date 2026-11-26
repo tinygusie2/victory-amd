@@ -243,6 +243,7 @@ impl<C: Clone> Picked<C> {
 
     /// Slot `slot` (with `record`, naming table entry `entry`) reads title
     /// memory `[from, to)` through host copy `copy` (`key`: its identity).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn keep(&mut self, slot: u32, key: usize, copy: &C, from: u64, to: u64, record: Record, entry: Option<u32>) {
         self.forget(slot);
         self.note_entry(slot, entry);

@@ -410,7 +410,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // memory (in turn they are said at each change).
     if guarded && light_mode() == 1 {
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) % 65_536 == 0 {
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
             let [bits, locked, filled] = light_asks();
             tracing::info!(
                 "refreshes of host copies go the light way (VICTORY_LIGHT_REFRESH=1): of the last 65536 askings that allowed for view memory {bits} were answered by the bits of their blocks and {locked} took the guards' lock (the others were of memory the kernel watches); {filled} holes found filled with nobody telling"
@@ -542,7 +542,7 @@ fn writes_as(start: usize, end: usize, guarded: bool, light: u8) -> Option<(u64,
 fn failed_asking(start: usize, end: usize) {
     use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, VirtualQuery};
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 2048 != 0 {
+    if !N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(2048) {
         return;
     }
     // SAFETY: plain data filled in by the query.
@@ -1240,7 +1240,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     // at each change).
     if absent_mode() == 1 {
         static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1) % 65_536 == 0 {
+        if (CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1).is_multiple_of(65_536) {
             let [asked, kept] = absent_looks();
             tracing::info!(
                 "blocks of view memory found uncommitted are asked of Windows again only after {} ms (VICTORY_ABSENT_ONCE=1): in the last 65536 askings of the guards {asked} questions to Windows about such blocks, {kept} blocks answered from their note",
@@ -1498,7 +1498,7 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
                 #[cfg(feature = "diagnostics")]
                 {
                     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 1024 == 0 {
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(1024) {
                         tracing::info!("a block of title memory could not be made read-only (one in 1024): {:#x}: {error}", block * BLOCK);
                     }
                 }
