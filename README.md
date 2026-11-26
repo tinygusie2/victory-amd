@@ -28,7 +28,7 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 10:40 UTC)
+## Status of this fork (2026-11-26, 11:50 UTC)
 
 **Playable, slowly: about 8 to 9.5 world frames per second at the first boat mission (the console runs
 30), 10 to 14 in lighter views. The tester has played from the opening through the prologue and past
@@ -49,7 +49,25 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 10:40 UTC)
+### Newest (2026-11-26, 11:50 UTC)
+
+- **Measured twice: a submission's texture checks side by side on the helper threads
+  (`VICTORY_PARALLEL_REFRESH=1`):** 8.7 and 9.4 ms less of the preparing thread's work a frame at equal
+  draws (two launches, switched on and off every 20 s); the checks run 3.6-3.8 times side by side.
+  With `VICTORY_SETTLE_ROOM=1` that is about 20 ms off that thread.
+- **Found: the frame's wall is now the graphics card.** With both on, the preparing thread works about
+  60 ms a frame at the boat but the card runs 84 to 128 ms a frame (by its own clock) and the frame does
+  not move: the two were nearly equal before. The card's time is spread over about 1,300 pipelines; the
+  translated programs are about 2.4 times the console's instruction count, broadly, with no single
+  cheap pattern. That is where the frame rate has to come from next.
+- **Measured at no gain, left off:** `VICTORY_WIDE_REFRESH`, `VICTORY_VIEW_KNOWN`, `VICTORY_CARD_HASH_WIDE`
+  (card time down, the preparing thread's up by more).
+- **The streaming of models is not held up on our side:** no DirectStorage request took a second; the
+  slowest was half a second. The stand-in models and the haze come from elsewhere (most likely the
+  title streaming per frame at a low frame rate; not proven).
+- The dispatch spread's switch is now `VICTORY_DISPATCH_SPREAD` (`VICTORY_SPREAD` is another feature's).
+
+### Earlier (2026-11-26, 10:40 UTC)
 
 - **Measured: flights get more room before they are settled (`VICTORY_SETTLE_ROOM=1`):** the thread
   that prepares submissions waits for the card 4.6 ms a frame instead of 17.7 at the first boat

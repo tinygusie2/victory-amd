@@ -4598,14 +4598,16 @@ fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
 }
 
 /// Whether dispatches past 65,535 groups in x are spread across z
-/// (`VICTORY_SPREAD`: on by default; `0` off, as before f93: clamped to
+/// (`VICTORY_DISPATCH_SPREAD`: on by default; `0` off, as before f93: clamped to
 /// 65,535; `alt`: twenty seconds with, twenty without, in turn, each change
 /// said in the log), to measure what the spread costs and shows within one
 /// run. Off, a translated program's words stay 0: it runs as dispatched.
 fn spread_on() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD").as_deref() {
+    // (Not `VICTORY_SPREAD`: `crate::spread` reads that one, for the title's
+    // pinned threads; run 326 alternated both under it.)
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_DISPATCH_SPREAD").as_deref() {
         Ok("0") => 0,
         Ok("alt") => 2,
         _ => 1,
@@ -4618,7 +4620,7 @@ fn spread_on() -> bool {
             static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
             if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
                 tracing::info!(
-                    "dispatches past 65,535 groups are spread across z from now (VICTORY_SPREAD=alt): {}",
+                    "dispatches past 65,535 groups are spread across z from now (VICTORY_DISPATCH_SPREAD=alt): {}",
                     if on { "ON" } else { "off, clamped to 65,535 as before" }
                 );
             }

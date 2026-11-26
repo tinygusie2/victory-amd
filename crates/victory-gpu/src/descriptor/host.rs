@@ -2366,7 +2366,13 @@ impl HostHeap {
         }
         let making = std::time::Instant::now();
         for &(index, handle) in &due {
+            #[cfg(feature = "diagnostics")]
+            MIRROR_HOW.with(|how| how.set(MIRROR_UNSET));
+            #[cfg(feature = "diagnostics")]
+            let one = std::time::Instant::now();
             self.mirror(index, handle, false);
+            #[cfg(feature = "diagnostics")]
+            mirror_counted(one.elapsed().as_micros() as u64);
         }
         super::SYNC_PARTS[2].fetch_add((making - walking).as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         super::SYNC_PARTS[3].fetch_add(making.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -2421,6 +2427,8 @@ impl HostHeap {
             && self.made_now[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
             && let Some(view) = view_at(i, generation)
         {
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_FAST);
             return Some(view);
         }
         let mut made = locked(&self.made, 4);
@@ -2430,6 +2438,8 @@ impl HostHeap {
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_NOT_VIEW);
             if made[index as usize] != 0 {
                 #[cfg(feature = "diagnostics")]
                 held.slot_changed();
@@ -2452,10 +2462,16 @@ impl HostHeap {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
+            #[cfg(feature = "diagnostics")]
+            let noting = std::time::Instant::now();
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
                     self.unmake(&mut made, stale);
                 }
+            }
+            #[cfg(feature = "diagnostics")]
+            if mirror_timing() {
+                MIRROR_US[0].fetch_add(noting.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
             }
             // A view of a texture object that has no host copy yet waits
             // for it, as buffer views wait for a draw: the slot is made
@@ -2479,11 +2495,17 @@ impl HostHeap {
                     .is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                mirror_how(MIRROR_KEPT);
                 // The slot goes on showing what it was made from.
                 self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            #[cfg(feature = "diagnostics")]
+            mirror_how(if later { MIRROR_LATER } else { MIRROR_MADE });
+            #[cfg(feature = "diagnostics")]
+            let creating = std::time::Instant::now();
             let kept = if later {
                 None
             } else {
@@ -2492,11 +2514,21 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            #[cfg(feature = "diagnostics")]
+            let keeping = std::time::Instant::now();
             self.keep(index, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            if mirror_timing() {
+                use std::sync::atomic::Ordering::Relaxed;
+                MIRROR_US[1].fetch_add((keeping - creating).as_micros() as u64, Relaxed);
+                MIRROR_US[2].fetch_add(keeping.elapsed().as_micros() as u64, Relaxed);
+            }
             // After the slot is made and kept: a reader without the lock
             // takes the record as made only once it is.
             self.made_now[index as usize].store(made[index as usize], std::sync::atomic::Ordering::Release);
         }
+        #[cfg(feature = "diagnostics")]
+        mirror_how(MIRROR_SAME);
         Some(view)
     }
 
@@ -2880,6 +2912,66 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+// What the view-heap pass's "make" does with each record it mirrors
+// (`HostHeap::mirror_copied_page`; fps41 round 12), by outcome of
+// `HostHeap::mirror`: made already (the lock-free look), not a view of
+// ours, the same view as made (under the lock), the old view kept, left
+// for later (a buffer or a texture with no host copy: a null view made),
+// made (a host view created). Diagnostics only.
+#[cfg(feature = "diagnostics")]
+const MIRROR_UNSET: usize = 6;
+/// Not inside the pass's timed `mirror` (draws and other passes mirror too).
+#[cfg(feature = "diagnostics")]
+const MIRROR_IDLE: usize = 7;
+#[cfg(feature = "diagnostics")]
+const MIRROR_FAST: usize = 0;
+#[cfg(feature = "diagnostics")]
+const MIRROR_NOT_VIEW: usize = 1;
+#[cfg(feature = "diagnostics")]
+const MIRROR_SAME: usize = 2;
+#[cfg(feature = "diagnostics")]
+const MIRROR_KEPT: usize = 3;
+#[cfg(feature = "diagnostics")]
+const MIRROR_LATER: usize = 4;
+#[cfg(feature = "diagnostics")]
+const MIRROR_MADE: usize = 5;
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The outcome of the `mirror` call being timed on this thread.
+    static MIRROR_HOW: std::cell::Cell<usize> = const { std::cell::Cell::new(MIRROR_IDLE) };
+}
+/// By outcome (the six above and "other"): records, and their microseconds.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRRORED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+/// Inside `mirror`, summed over the records: the buffer notes and the
+/// unmaking of stale slots, creating the view (or the null one), keeping
+/// the slot's resource (the old one retired).
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRROR_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+#[cfg(feature = "diagnostics")]
+fn mirror_how(how: usize) {
+    MIRROR_HOW.with(|cell| {
+        if cell.get() == MIRROR_UNSET {
+            cell.set(how);
+        }
+    });
+}
+
+/// Whether this thread is inside the pass's timed `mirror`.
+#[cfg(feature = "diagnostics")]
+fn mirror_timing() -> bool {
+    MIRROR_HOW.with(|cell| cell.get() != MIRROR_IDLE)
+}
+
+#[cfg(feature = "diagnostics")]
+fn mirror_counted(us: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let how = MIRROR_HOW.with(|cell| cell.replace(MIRROR_IDLE)).min(MIRROR_UNSET);
+    MIRRORED[how].fetch_add(1, Relaxed);
+    MIRRORED[7 + how].fetch_add(us, Relaxed);
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
