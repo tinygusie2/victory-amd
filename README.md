@@ -28,7 +28,7 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 09:00 UTC)
+## Status of this fork (2026-11-26, 10:40 UTC)
 
 **Playable, slowly: about 8 to 9.5 world frames per second at the first boat mission (the console runs
 30), 10 to 14 in lighter views. The tester has played from the opening through the prologue and past
@@ -49,7 +49,26 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 09:00 UTC)
+### Newest (2026-11-26, 10:40 UTC)
+
+- **Measured: flights get more room before they are settled (`VICTORY_SETTLE_ROOM=1`):** the thread
+  that prepares submissions waits for the card 4.6 ms a frame instead of 17.7 at the first boat
+  mission, 11.5 ms less of its work a frame at equal draws (one launch, switched on and off every
+  20 s). Off by default; the test set turns it on.
+- **Compute dispatches of more than 65,535 groups run spread across z** (after upstream VIctory pull
+  request #2312): the title asks for up to 115,200 groups (one per 32 pixels at 1440p) in a pass that
+  was cut to 65,535, losing 43 % of it. Tested on the card; costs nothing measurable. No visible change
+  yet (the pass most likely gathers ray-traced light, which does not run).
+- **Texture slots that read zeros for good are asked again (`VICTORY_REASK_BLANK=1`, diagnostics
+  builds):** at the boat the slots showing a copy with no level went from about 385 to 0.
+- **BC7 channel rotation only in modes 4 and 5** (upstream VIctory pull request #3111).
+- **Instruments:** reads held for the title's DirectStorage Submit (they wait about 40 ms, so not the
+  cause of the late models), the price of a failed write-watch asking, refreshes that copied nothing,
+  `VICTORY_DENY_PIPELINES` (a pipeline is never built), the ray-tracing builder's pipelines named.
+- **Measured at no gain, left off:** `VICTORY_NEAR_WRITES` (the work moved into the final flush),
+  `VICTORY_SYNC_BESIDE` (the two threads slow each other), `VICTORY_VIEW_KNOWN` (about 2 ms).
+
+### Earlier (2026-11-26, 09:00 UTC)
 
 - **Measured: the texture pass on a thread of its own (`VICTORY_HEAP_WORKER=1`, pull request #1007)
   raises the world frame rate at the boat from 6.2 to 6.7 to 8.65, 9.50 and 9.53 frames a second**

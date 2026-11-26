@@ -384,6 +384,9 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        for p in b.pipelines.iter().filter(|p| !make::now(p)) {
+            tracing::warn!(shaders = ?make::shaders(p), "a builder pipeline with no host pipeline");
+        }
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -618,6 +621,9 @@ fn hand_out(
         let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
         b.pipelines.push(host.clone());
         b.whole = false;
+        // Named once each (gfx41): which programs are the builder's, to
+        // match against the refused and untranslated ones.
+        tracing::info!(n = b.pipelines.len(), ?shaders, "a pipeline of the ray-tracing structure builder");
     }
     let pipeline = Box::new(Pipeline {
         object: Object::new(&FUNCTIONS),

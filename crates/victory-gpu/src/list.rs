@@ -1361,7 +1361,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
         && src != 0
     {
         let len = len as usize;
-        list.defer(move || {
+        // Its place is known: `VICTORY_NEAR_WRITES` uses it (without the
+        // switch the step is the same as `defer`'s).
+        list.defer_at(dst as usize, len, move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
             {

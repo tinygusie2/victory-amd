@@ -671,6 +671,13 @@ impl Tiled {
         old != shown
     }
 
+    /// The levels held at the last upload, a bit a level (0 before the
+    /// first): for the slot census (`HostHeap::placed_slot_census`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn held_now(&self) -> u32 {
+        self.held.load(Ordering::Relaxed)
+    }
+
     /// The first level a view of the texture may show; `None` while no
     /// level is both held and given (the views are then as the title made
     /// them, and read zeros).

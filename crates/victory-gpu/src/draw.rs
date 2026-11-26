@@ -215,6 +215,12 @@ enum BakeMode {
     Off,
     Count,
     Upload,
+    /// [`BakeMode::Upload`] also while the card has no room
+    /// (`VICTORY_BAKE_SOURCES=full`), as fork pull request #1264 had it:
+    /// at the boat save every such upload was skipped for room (run 316: 55
+    /// of 55), the card being at its line through the whole world. Still
+    /// within `VICTORY_BAKE_SOURCES_MB` a draw.
+    Full,
 }
 
 /// [`BakeMode`], and the bytes one draw may have uploaded.
@@ -224,6 +230,7 @@ fn bake_sources_mode() -> (BakeMode, u64) {
         let mode = match std::env::var("VICTORY_BAKE_SOURCES").ok().as_deref().map(str::trim) {
             Some("count") => BakeMode::Count,
             Some("1") => BakeMode::Upload,
+            Some("full") => BakeMode::Full,
             _ => BakeMode::Off,
         };
         let mb = std::env::var("VICTORY_BAKE_SOURCES_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(64);
@@ -534,6 +541,10 @@ pub(crate) struct State {
     /// whether a draw has read from it since.
     window_jumped: bool,
     window_read: bool,
+    /// A direct dispatch spread across z, for [`State::host_word`] at its
+    /// bind: `[row, asked x]` (`[0, 0]`: not spread; an indirect one gets
+    /// its words from the clamp through its command signature).
+    dispatch_spread: [u32; 2],
     /// Diagnostics: the argument buffer and the offset of the indirect
     /// command before this one on the list.
     #[cfg(feature = "diagnostics")]
@@ -1005,6 +1016,22 @@ fn heap_recheck() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_RECHECK").is_none_or(|v| v != "0"))
 }
+
+/// Whether a texture picked by index that a look found changed after its
+/// upload is looked at again in the next frame, not after
+/// `RECHECK_FRAMES[0]` (`VICTORY_RECHECK_SOON=1`; off by default). A
+/// texture whose bytes land in several pieces, or that the title keeps
+/// writing, was shown four frames behind at each change. (The AMD sibling
+/// repository's switch of that name, on by default there.)
+fn recheck_soon() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RECHECK_SOON").is_some_and(|v| v == "1"))
+}
+
+/// Uploads of textures picked by index looked at again in the next frame
+/// because a look had found them changed ([`recheck_soon`]), since the
+/// start.
+pub(crate) static HEAP_TEXTURES_SOON: AtomicU64 = AtomicU64::new(0);
 /// Times a placed texture's slot was passed over because its memory is not
 /// mapped.
 pub(crate) static HEAP_TEXTURES_AWAY: AtomicU64 = AtomicU64::new(0);
@@ -1441,7 +1468,10 @@ impl State {
         dword: u32,
         memory: Option<&crate::memory::Ready>,
     ) -> u32 {
-        use victory_shader::emit::{USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        use victory_shader::emit::{USER_DISPATCH_SPREAD, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS};
+        if kind == USER_DISPATCH_SPREAD {
+            return self.dispatch_spread[usize::from(dword != 0)];
+        }
         if kind == USER_MEMORY_BASE {
             return memory.map_or(0, |m| m.base);
         }
@@ -2489,8 +2519,8 @@ impl State {
         let waiting = !sources.queued.is_empty() || !sources.unmade.is_empty();
         let mut done = [0u64; 4];
         let mut skipped = false;
-        if mode == BakeMode::Upload && waiting {
-            if crate::resource::room() {
+        if matches!(mode, BakeMode::Upload | BakeMode::Full) && waiting {
+            if mode == BakeMode::Full || crate::resource::room() {
                 let _pass = crate::heap_worker::on().then(crate::heap_worker::urgent);
                 host.texture_slots_requeue(&sources.unmade, crate::frame::current());
                 PASS_SOURCES.set(Some(sources.queued.iter().chain(&sources.unmade).copied().collect()));
@@ -2779,13 +2809,16 @@ impl State {
         // makes room again: so the slots are still looked at (the pass
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
-        let mut room = crate::resource::room();
         // A skin-bake draw's own textures (`State::bake_sources_pass`): a
         // run for them alone, on the thread that records the draw. Nothing
         // of the queue's upkeep is done in it, which a pass of this frame
         // did or will do.
         let sources = PASS_SOURCES.take();
         let only = sources.is_some();
+        // A bake draw's own run with `VICTORY_BAKE_SOURCES=full` goes on
+        // as if the card had room, within its own bytes.
+        let forced = only && bake_sources_mode().0 == BakeMode::Full;
+        let mut room = forced || crate::resource::room();
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2814,6 +2847,10 @@ impl State {
             if room {
                 host.texture_slots_waiting(frame);
             }
+            // Slots that read zeros for good and nothing asks for again
+            // (`VICTORY_REASK_BLANK=1`; off by default; diagnostics builds).
+            #[cfg(feature = "diagnostics")]
+            host.texture_slots_blank(frame);
         }
         let due = match &sources {
             // The bake draw's own, due or not, held or not.
@@ -2935,6 +2972,9 @@ impl State {
             // first look for the rest of the run. The look reads 48 KiB;
             // only a changed texture is uploaded again.
             // `VICTORY_HEAP_RECHECK=0`: uploaded once, as before.
+            // One found changed by such a look is looked at again in the
+            // next frame with `VICTORY_RECHECK_SOON=1` ([`recheck_soon`]).
+            let mut again_in = RECHECK_FRAMES[0];
             if let Some((at, len, print, looks, uploaded)) = host.texture_slot_checked(index) {
                 if crate::texture::fingerprint(at, len) == print {
                     HEAP_TEXTURES_RECHECKED[0].fetch_add(1, Ordering::Relaxed);
@@ -2946,6 +2986,9 @@ impl State {
                     }
                     continue;
                 }
+                if recheck_soon() {
+                    again_in = 1;
+                }
                 let n = HEAP_TEXTURES_RECHECKED[1].fetch_add(1, Ordering::Relaxed);
                 if n < 200 || n.is_multiple_of(1000) {
                     tracing::warn!(
@@ -2955,6 +2998,7 @@ impl State {
                         frames_after_upload = frame.saturating_sub(uploaded),
                         looks,
                         changed = n + 1,
+                        looked_at_next_frame = HEAP_TEXTURES_SOON.load(Ordering::Relaxed),
                         "a texture picked by index changed after its upload with nothing to tell of it: uploaded again"
                     );
                 }
@@ -3141,7 +3185,7 @@ impl State {
             since_asked += bytes;
             if room && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room();
+                room = forced || crate::resource::room();
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
@@ -3149,7 +3193,10 @@ impl State {
                 // Whole and uploaded: looked at again (see above).
                 Some((at, len)) => {
                     let print = crate::texture::fingerprint(at, len);
-                    host.texture_slot_recheck(index, write, frame + RECHECK_FRAMES[0], (at, len), print, 0, frame);
+                    if again_in != RECHECK_FRAMES[0] {
+                        HEAP_TEXTURES_SOON.fetch_add(1, Ordering::Relaxed);
+                    }
+                    host.texture_slot_recheck(index, write, frame + again_in, (at, len), print, 0, frame);
                 }
                 None => host.texture_slot_done(index, write, again),
             }
@@ -3278,7 +3325,18 @@ impl State {
             once!("a dispatch with a graphics pipeline");
             return;
         }
-        if !self.bind(list, p, true) {
+        // More than 65,535 groups in x: spread across z for a program that
+        // takes the spread words (`USER_DISPATCH_SPREAD`).
+        let (row, asked, gx, gy, gz) = victory_shader::emit::spread_groups(x, y, z, spreads(p).is_some());
+        if row != 0 {
+            SPREAD[0].fetch_add(1, Ordering::Relaxed);
+        } else if gx > 65_535 || gy > 65_535 || gz > 65_535 {
+            once!(gx, gy, gz, "a dispatch asks for more than 65,535 groups in a dimension and is not spread");
+        }
+        self.dispatch_spread = [row, asked];
+        let bound = self.bind(list, p, true);
+        self.dispatch_spread = [0, 0];
+        if !bound {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             // A stage of the structure builder that cannot be bound is a
             // dropped stage: the others stop too.
@@ -3290,7 +3348,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
-        unsafe { list.list.Dispatch(x, y, z) };
+        unsafe { list.list.Dispatch(gx, gy, gz) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -4237,10 +4295,19 @@ impl State {
             },
             None => None,
         };
-        let Some(signature) = matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
-            .then(|| host_signature(kind, stride))
+        // A dispatch of a program that takes the spread words: the clamp
+        // writes [row, asked x, x, y, z] records, run through a signature
+        // that sets the two words, then dispatches.
+        let spread = (kind == DISPATCH && p.compute)
+            .then(|| spreads(p))
             .flatten()
-        else {
+            .and_then(|(param, index)| host_spread_signature(&p.root, param, index));
+        let is_spread = spread.is_some();
+        let Some(signature) = spread.or_else(|| {
+            matches!(kind, DRAW | INDEXED | DISPATCH | MESH)
+                .then(|| host_signature(kind, stride))
+                .flatten()
+        }) else {
             why("no host signature");
             return false;
         };
@@ -4406,7 +4473,9 @@ impl State {
                 let bounded = if windowed && records > 1 {
                     crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
                 } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                    // (A spread dispatch is never windowed: `windowed` is
+                    // false for dispatches.)
+                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records), is_spread)
                 };
                 let Some(bounded) = bounded else {
                     self.window = None;
@@ -4493,6 +4562,9 @@ impl State {
         // back (`crate::indirect`).
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
+            if is_spread {
+                SPREAD[1].fetch_add(1, Ordering::Relaxed);
+            }
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
@@ -4503,6 +4575,105 @@ impl State {
 /// The host command signature for one argument of `kind` with records
 /// `stride` bytes apart (no root arguments, so no root signature), made
 /// once.
+/// Dispatches spread across z since the frame line last took them: direct,
+/// indirect ([`victory_shader::emit::USER_DISPATCH_SPREAD`]).
+pub(crate) static SPREAD: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The user-data root parameter of compute pipeline `p` whose program takes
+/// the spread words, and the index of the first in it (the second follows:
+/// one root-constant argument sets both); `None` for any other pipeline.
+fn spreads(p: &crate::pipeline::host::HostPipeline) -> Option<(u32, u32)> {
+    if !spread_on() {
+        return None;
+    }
+    let stage = p.stages.first()?;
+    let (param, _) = stage.user_data?;
+    let kind = RootType::Other(victory_shader::emit::USER_DISPATCH_SPREAD);
+    let words = &stage.translated().host.user_data;
+    let first = words.iter().find(|u| u.root == kind && u.dword == 0)?.index;
+    words
+        .iter()
+        .any(|u| u.root == kind && u.dword == 1 && u.index == first + 1)
+        .then_some((param, first))
+}
+
+/// Whether dispatches past 65,535 groups in x are spread across z
+/// (`VICTORY_SPREAD`: on by default; `0` off, as before f93: clamped to
+/// 65,535; `alt`: twenty seconds with, twenty without, in turn, each change
+/// said in the log), to measure what the spread costs and shows within one
+/// run. Off, a translated program's words stay 0: it runs as dispatched.
+fn spread_on() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SPREAD").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "dispatches past 65,535 groups are spread across z from now (VICTORY_SPREAD=alt): {}",
+                    if on { "ON" } else { "off, clamped to 65,535 as before" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// The command signature of a spread dispatch: two root constants (row,
+/// asked x) at `index` of root parameter `param`, then the dispatch; 20
+/// bytes a record (the clamp's spread layout). Made once per root
+/// signature, parameter and index. (After upstream VIctory pull request
+/// #2312.)
+fn host_spread_signature(root: &ID3D12RootSignature, param: u32, index: u32) -> Option<ID3D12CommandSignature> {
+    type Key = (usize, u32, u32);
+    static MADE: std::sync::Mutex<Vec<(Key, ID3D12CommandSignature)>> = std::sync::Mutex::new(Vec::new());
+    let key = (root.as_raw() as usize, param, index);
+    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, s)) = made.iter().find(|(k, _)| *k == key) {
+        return Some(s.clone());
+    }
+    let args = [
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT,
+            Anonymous: D3D12_INDIRECT_ARGUMENT_DESC_0 {
+                Constant: D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                    RootParameterIndex: param,
+                    DestOffsetIn32BitValues: index,
+                    Num32BitValuesToSet: 2,
+                },
+            },
+        },
+        D3D12_INDIRECT_ARGUMENT_DESC {
+            Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
+            ..Default::default()
+        },
+    ];
+    let desc = D3D12_COMMAND_SIGNATURE_DESC {
+        ByteStride: 20,
+        NumArgumentDescs: args.len() as u32,
+        pArgumentDescs: args.as_ptr(),
+        NodeMask: 0,
+    };
+    let mut signature: Option<ID3D12CommandSignature> = None;
+    // SAFETY: two valid argument descriptions and a live root signature.
+    let result = unsafe { crate::host::host()?.device.CreateCommandSignature(&desc, Some(root), &mut signature) };
+    if let Err(e) = result {
+        once!(error = %e, param, index, "spread command signature refused");
+        return None;
+    }
+    let signature = signature?;
+    made.push((key, signature.clone()));
+    Some(signature)
+}
+
 fn host_signature(kind: u32, stride: u32) -> Option<ID3D12CommandSignature> {
     static MADE: std::sync::Mutex<Vec<((u32, u32), ID3D12CommandSignature)>> =
         std::sync::Mutex::new(Vec::new());

@@ -945,6 +945,10 @@ pub(crate) fn device_removed() -> Option<String> {
 
 /// Writes of title view-heap slots with a placed texture view and with a
 /// view of a texture object, since the start (diagnostic counts).
+/// Slots asked again by [`HostHeap::texture_slots_blank`] since the start:
+/// shown with no level judged held (Z), null in no queue (N).
+#[cfg(feature = "diagnostics")]
+pub(crate) static REASKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1618,6 +1622,122 @@ impl HostHeap {
         crate::tiles::STATS[10].fetch_add(slots.len() as u64, std::sync::atomic::Ordering::Relaxed);
         slots.len()
     }
+
+    /// `VICTORY_REASK_BLANK=1` (off by default): see
+    /// [`HostHeap::texture_slots_blank`].
+    #[cfg(feature = "diagnostics")]
+    fn reask_blank() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_REASK_BLANK").is_some_and(|v| v == "1"))
+    }
+
+    /// Slots of placed textures that read zeros for good and that nothing
+    /// asks for again, whose memory's first page is mapped now: up to
+    /// [`Self::REASK_A_PASS`] made due from the next frame, about once a
+    /// second (`VICTORY_REASK_BLANK=1`). Two classes of the census
+    /// ([`HostHeap::placed_slot_census`]): (Z) shown, made level by level,
+    /// showing no level and judged holding none at its last upload; (N)
+    /// null and in no texture queue. Run 319 at the boat: about 384 and 795
+    /// of 13,000 slots, never asked again by anything else (gfx41). A slot
+    /// asked three times that is still blank is left alone for 30 s.
+    /// Returns how many. (Diagnostics builds only for now: an experiment,
+    /// built on the census's helpers.)
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn texture_slots_blank(&self, frame: u64) -> usize {
+        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        static ASKED: Mutex<Option<std::collections::HashMap<u32, (u8, u64)>>> = Mutex::new(None);
+        if self.sampler || !Self::reask_blank() {
+            return 0;
+        }
+        let now = crate::host::now_ms();
+        let last = LAST.load(Relaxed);
+        if now.saturating_sub(last) < 1_000 || LAST.swap(now, Relaxed) != last {
+            return 0;
+        }
+        let slots: Vec<(u32, u64)> = {
+            let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            placed.by_slot.iter().map(|(&slot, &start)| (slot, start)).collect()
+        };
+        let keys: Vec<u64> = {
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&(slot, _)| made.get(slot as usize).copied().unwrap_or(0)).collect()
+        };
+        let queued: Vec<bool> = {
+            let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            slots.iter().map(|&(slot, _)| textures.slots.contains_key(&slot)).collect()
+        };
+        let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+        let asked = asked.get_or_insert_with(std::collections::HashMap::new);
+        let mut due = Vec::new();
+        let (mut z, mut n) = (0u64, 0u64);
+        for (i, &(slot, start)) in slots.iter().enumerate() {
+            if due.len() >= Self::REASK_A_PASS {
+                break;
+            }
+            if self.tabled_lately(slot, frame) {
+                continue;
+            }
+            let key = keys[i];
+            let shows = key != 0
+                && self.kept[(slot % KEPT_PIECES) as usize]
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get((slot / KEPT_PIECES) as usize)
+                    .is_some_and(Option::is_some);
+            let class_z = shows
+                && view_at(key as u32, (key >> 32) as u32)
+                    .and_then(|view| match view {
+                        View::Placed(false, resource, desc) => crate::resource::texture_at_made(
+                            u64::from(desc[10]) | u64::from(desc[11]) << 32,
+                            &resource,
+                        ),
+                        View::Shader(texture, _) => Some(texture as crate::object::This),
+                        _ => None,
+                    })
+                    .and_then(|texture| {
+                        let on_demand = crate::resource::host_tiled(texture)?;
+                        let tiled = on_demand.tiled()?;
+                        Some(tiled.first_shown().is_none() && tiled.held_now() == 0)
+                    })
+                    .unwrap_or(false);
+            let class_n = !shows && key == 0 && !queued[i];
+            if !(class_z || class_n) {
+                asked.remove(&slot);
+                continue;
+            }
+            let (times, since) = asked.get(&slot).copied().unwrap_or((0, 0));
+            if times >= 3 && now.saturating_sub(since) < 30_000 {
+                continue;
+            }
+            if !crate::texture::committed(start as *const u8, 1) {
+                continue;
+            }
+            asked.insert(slot, (if times >= 3 { 1 } else { times + 1 }, now));
+            if class_z {
+                z += 1;
+            } else {
+                n += 1;
+            }
+            due.push(slot);
+        }
+        if due.is_empty() {
+            return 0;
+        }
+        {
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for &slot in &due {
+                textures.changed(slot, frame, frame + 1);
+            }
+        }
+        REASKED[0].fetch_add(z, Relaxed);
+        REASKED[1].fetch_add(n, Relaxed);
+        due.len()
+    }
+
+    /// Blank slots a pass asks again ([`HostHeap::texture_slots_blank`]).
+    #[cfg(feature = "diagnostics")]
+    const REASK_A_PASS: usize = 128;
 
     /// Textures a pass asks again for their levels
     /// ([`HostHeap::texture_slots_waiting`]): the first ones given tiles
@@ -2463,7 +2583,7 @@ impl HostHeap {
                 })
                 .collect()
         };
-        let mut c = [0u64; 9];
+        let mut c = [0u64; 10];
         let mut forgotten = 0u64;
         for (i, &(slot, start)) in slots.iter().enumerate() {
             c[0] += 1;
@@ -2485,10 +2605,21 @@ impl HostHeap {
                         View::Shader(texture, _) => Some(texture as crate::object::This),
                         _ => None,
                     })
-                    .is_some_and(|texture| {
-                        crate::resource::host_tiled(texture).is_some() && crate::resource::first_shown(texture).is_none()
+                    // The levels judged the title's at its last upload, if it
+                    // shows none (0 also if never uploaded).
+                    .and_then(|texture| {
+                        let on_demand = crate::resource::host_tiled(texture)?;
+                        let tiled = on_demand.tiled()?;
+                        tiled.first_shown().is_none().then(|| tiled.held_now())
                     });
-                c[if blank { 2 } else { 1 }] += 1;
+                match blank {
+                    None => c[1] += 1,
+                    Some(0) => {
+                        c[2] += 1;
+                        c[9] += 1;
+                    }
+                    Some(_) => c[2] += 1,
+                }
                 continue;
             }
             if key != 0 {
@@ -2513,7 +2644,8 @@ impl HostHeap {
              {} shown from a copy made level by level that has no level with tiles (reads zeros); {} made but null (the host \
              could not make the view); null: {} held for room, {} waiting for their memory, {} in the queue otherwise, {} in no \
              queue (about {} of those with their first page mapped now); the census took {} ms; placed views the host could \
-             not make since the start: {} shader views, {} unordered",
+             not make since the start: {} shader views, {} unordered; of the slots that read zeros, {} show a copy with no \
+             level judged the title's at its last upload (never uploaded, or nothing held: no room is asked for those);              asked again since the start (VICTORY_REASK_BLANK): {} shown with no level held, {} null in no queue",
             c[0],
             c[1],
             c[2],
@@ -2526,6 +2658,9 @@ impl HostHeap {
             began.elapsed().as_millis(),
             PLACED_NOT_MADE[0].load(Relaxed),
             PLACED_NOT_MADE[1].load(Relaxed),
+            c[9],
+            REASKED[0].load(Relaxed),
+            REASKED[1].load(Relaxed),
         );
     }
 
