@@ -2211,7 +2211,25 @@ impl State {
         if !stores {
             return;
         }
-        if !crate::indirect::gather_by_copy() || crate::pipeline::host_pipeline(self.pipeline as This).is_none() {
+        // Whole, as before: without the switch, for a pipeline the layer
+        // does not know, and for shaders that can store through a view
+        // that is NOT declared where they are prepared: a buffer picked
+        // from the view heap by an index the shader computes
+        // (`State::heap_buffers`: what such a shader writes through a
+        // picked unordered access view is declared nowhere), and title
+        // memory by address (`crate::memory::ready` declares the numbered
+        // copies once per list; a copy another list numbers after that is
+        // reached through the directory and not declared in this list).
+        let whole = !crate::indirect::gather_by_copy()
+            || crate::pipeline::host_pipeline(self.pipeline as This).is_none_or(|p| {
+                p.stages.iter().any(|stage| {
+                    let t = stage.translated();
+                    t.stores
+                        && (t.host.root_srvs.contains(&victory_shader::emit::SLOT_STRIDES)
+                            || t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY))
+                })
+            });
+        if whole {
             list.gather_close();
         }
     }
