@@ -28,7 +28,7 @@ developer or publisher.
   are carried here unchanged apart from one merge conflict.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
-## Status of this fork (2026-11-26, 00:00 UTC)
+## Status of this fork (2026-11-26, 02:15 UTC)
 
 **Playable for half an hour at a time, slowly: about 7 to 12 frames per second (the console runs
 30). The tester has played from the opening through the prologue and past the first boat mission.
@@ -50,7 +50,27 @@ Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 | Stability | **the card is lost after 30 to 50 minutes of play**: Windows reports the device removed (0x887A0005) with no driver event and no freeze, twice (runs 277 and 279); once a hang after 6 minutes with two driver events (run 276). Cause not known. In the tree to find it: crash tracing cheap enough to leave on (`VICTORY_D3D12_DRED=faults`), the memory at the moment of a loss, and a cap on oversized constant views (an invalid call another tester's card answered with a removal) |
 | Memory | about 23 to 27 GB of the PC's 32 GB and 9.2 to 9.6 GB of the card's 10.3 GB budget while playing |
 
-### Newest (2026-11-26, 00:00 UTC)
+### Newest (2026-11-26, 02:15 UTC)
+
+- **Measured: `VICTORY_LOOKUP_CACHE=1` (pull request #1237) is worth about 14 ms a frame** on the
+  test machine (run 293, the switch in turn, a fit at equal draw counts: 84 ms + 13.6 ms per 1,000
+  draws, minus 14 with it, plus or minus about 7; the recording threads together 57 ms less). About
+  540,000 asks for a buffer's host copy a frame, 89 % of them answered without the lock.
+- **Measured at nothing:** `VICTORY_HEAP_SYNC_CUT` (run 286: 37 fewer heap pages read a frame, the
+  pass's time unchanged). Left off.
+- **Fixed from Direct3D's debug layer's own words** (runs 283 and 289): a pipeline that blends into
+  an integer render target; a draw whose pipeline declares another render target format than the
+  one bound (a pipeline for the bound format is made, `VICTORY_TARGET_VARIANTS=0` turns that off).
+- **Pull request #1241** (a view of a card-written texture copied even after an upload of the same
+  view) is in. It did not change the black in shadowed areas (run 291).
+- **Still open:** the card is lost 30 to 50 minutes into a session (the memory figures at two
+  losses: 1.3 and 2.0 GB of the PC's 32 free, the process at its largest; another tester reports
+  the same signature with "Kernel memory failure" under the debug layer; not shown to be the cause
+  here). Shadowed areas are black. In a heavy outdoor scene (7,000 to 9,000 draws) the frame is
+  157 to 195 ms.
+- Every run's log goes to `diagnostics/` as soon as the run ends.
+
+### Before that (2026-11-26, 00:00 UTC)
 
 **Written and unit-tested, not yet measured in a game. Every switch here is off by default; the
 numbers are estimates until a run carries them.**
