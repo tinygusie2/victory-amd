@@ -87,6 +87,12 @@ struct Meter {
     /// not written since (its list never ran) still holds that, and is
     /// not counted again.
     seen: Vec<(u64, u64)>,
+    /// Since the last line "the card per frame": where each whole list
+    /// began and ended, in ticks of the queue's clock ([`gaps_line`]).
+    spans: Vec<(u64, u64)>,
+    /// Frames since that line, and when it was last written.
+    gap_frames: u64,
+    gap_line: std::time::Instant,
 }
 
 // SAFETY: host objects (free-threaded) and a mapping only read, behind a lock.
@@ -152,6 +158,9 @@ fn make() -> Option<Meter> {
             by_pipeline: Default::default(),
             frames: 0,
             seen: vec![(0, 0); PAIRS as usize],
+            spans: Vec::new(),
+            gap_frames: 0,
+            gap_line: std::time::Instant::now(),
         })
     }
 }
@@ -260,6 +269,69 @@ fn micros(begin: u64, end: u64, frequency: u64) -> u64 {
     ((end - begin) as u128 * 1_000_000 / frequency as u128).min(10_000_000) as u64
 }
 
+/// The line "the card per frame": of the direct queue's time by its own
+/// clock, how long a list of ours was running (the union of the lists'
+/// stamps) and how long none was, between one list's end and the next
+/// list's begin, by the length of the gap. The frame line's "card: idle"
+/// says how much of a frame had nothing of ours queued; what the gaps
+/// hold beyond that is the card standing with work of ours queued, which
+/// no line said (runs 293 to 300: 26 to 43 ms a frame). Short gaps are
+/// what the card pays between two lists; long ones are waits: for the
+/// title, for a present, for memory to be mapped under a texture, for
+/// another program's turn on the card. Diagnostics, every five seconds.
+fn gaps_line(m: &mut Meter) {
+    let frames = std::mem::take(&mut m.gap_frames).max(1) as f64;
+    let mut spans = std::mem::take(&mut m.spans);
+    if spans.len() < 2 || m.frequency == 0 {
+        return;
+    }
+    spans.sort_unstable();
+    let us = |ticks: u64| (ticks as u128 * 1_000_000 / m.frequency as u128) as u64;
+    // Gaps under 0.1 ms, to 2 ms, to 20 ms, and longer: how many, and
+    // their microseconds.
+    let mut gaps = [(0u64, 0u64); 4];
+    let (mut running, mut summed) = (0u64, 0u64);
+    let mut reached = spans[0].0;
+    for &(begin, end) in &spans {
+        summed += us(end - begin);
+        if begin > reached {
+            let gap = us(begin - reached);
+            let class = match gap {
+                0..100 => 0,
+                100..2_000 => 1,
+                2_000..20_000 => 2,
+                _ => 3,
+            };
+            gaps[class].0 += 1;
+            gaps[class].1 += gap;
+            reached = begin;
+        }
+        if end > reached {
+            running += us(end - reached);
+            reached = end;
+        }
+    }
+    let ms = |us: u64| us as f64 / 1e3 / frames;
+    tracing::info!(
+        "the card per frame ({frames:.0} frames, the direct queue by its own clock): a list of ours running {:.1} ms (the lists' \
+         stamps add to {:.1} ms; {:.0} lists); no list running between one list's end and the next one's begin: {:.1} ms in \
+         {:.0} gaps under 0.1 ms, {:.1} ms in {:.0} gaps of 0.1 to 2 ms, {:.1} ms in {:.0} gaps of 2 to 20 ms, {:.1} ms in \
+         {:.0} gaps over 20 ms (of the gaps' time, the frame line's \"card: idle\" had nothing of ours queued; the rest is the \
+         card standing with work of ours queued)",
+        ms(running),
+        ms(summed),
+        spans.len() as f64 / frames,
+        ms(gaps[0].1),
+        gaps[0].0 as f64 / frames,
+        ms(gaps[1].1),
+        gaps[1].0 as f64 / frames,
+        ms(gaps[2].1),
+        gaps[2].0 as f64 / frames,
+        ms(gaps[3].1),
+        gaps[3].0 as f64 / frames,
+    );
+}
+
 /// The pairs recorded long enough ago are read and added to the frame
 /// log's totals. Called once a frame.
 pub(crate) fn collect() {
@@ -286,6 +358,11 @@ pub(crate) fn collect() {
             continue;
         }
         let us = micros(begin, end, m.frequency);
+        // A whole list (not a pipeline's stretch inside one), run by the
+        // card: for the gaps between lists.
+        if !matches!(kind, Kind::Pipeline) && begin != 0 && end > begin {
+            m.spans.push((begin, end));
+        }
         use crate::framelog::{T, add};
         match kind {
             Kind::Sync => {
@@ -313,6 +390,11 @@ pub(crate) fn collect() {
                 }
             }
         }
+    }
+    m.gap_frames += 1;
+    if now.duration_since(m.gap_line) >= std::time::Duration::from_secs(5) {
+        gaps_line(m);
+        m.gap_line = now;
     }
     m.frames += 1;
     if m.frames >= 256 {
