@@ -2772,6 +2772,15 @@ fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
     }
 }
 
+/// Whether typed buffer views of 32-bit integer formats are made in the
+/// float format of the same width (`VICTORY_BIT_EXACT_VIEWS=1`; off here).
+/// On AMD cards a float typed load flushes the small integers' bit patterns
+/// (denormals) to zero; suspected cause of the black lit skin in r12.
+fn bit_exact_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_BIT_EXACT_VIEWS").is_ok_and(|v| v == "1"))
+}
+
 /// A buffer view of title memory at `address` on its host copy: the first
 /// element moves by the copy's offset.
 /// Bytes per element of a buffer view.
@@ -3203,7 +3212,9 @@ fn buffer_srv(
             Flags: D3D12_BUFFER_SRV_FLAG_RAW,
         };
     }
-    desc.Format = bit_exact_format(desc.Format);
+    if bit_exact_views() {
+        desc.Format = bit_exact_format(desc.Format);
+    }
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -3318,7 +3329,9 @@ fn buffer_uav(
     buffer.CounterOffsetInBytes = 0;
     let (first, count, stride) = (buffer.FirstElement, buffer.NumElements, buffer.StructureByteStride);
     let raw = buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
-    desc.Format = bit_exact_format(desc.Format);
+    if bit_exact_views() {
+        desc.Format = bit_exact_format(desc.Format);
+    }
     if window.is_some() {
         // (Left out at first: every structured unordered access view was then
         // refused by `buffer_view_ok` and left null, runs 15 and 16.)
