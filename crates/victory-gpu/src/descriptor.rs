@@ -215,6 +215,7 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
+                    past_the_host(from, to, start as usize, step, (mirrored_count, heap.desc.count), &page_bytes, slots.end);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
@@ -251,6 +252,68 @@ pub(crate) fn sync_heaps() {
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
+    }
+}
+
+/// Since the start, of the title's view heaps ([`past_the_host`]): the
+/// highest title slot on a page the title changed, plus one; the records
+/// that are not all zeros the title wrote at slots the host heap has no
+/// title slot for (counted at every look, so a record is counted again
+/// when its page changes again); the highest such slot, plus one; and the
+/// host's count of title slots.
+pub(crate) static PAST_THE_HOST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// An instrument, no change of what is mirrored: of the page `[from, to)`
+/// of a title view heap at `start` (records `step` bytes, `page` its
+/// bytes), notes how high the title's records reach, and the records it
+/// wrote at slots from `mirrored` on, which the host heap has no title
+/// slot for when the host caps the heap's size (the title's heap is
+/// `count` slots). Why it matters: the host slots from `mirrored` on are
+/// the per-draw tables', and a shader's view index is clamped only at the
+/// heap's last slot: a shader that picks a view by an index from
+/// `mirrored` on reads a slot that holds some draw's table, of whatever
+/// kind. Whether the title ever has views there was never measured (the
+/// highest slot seen was "about 720,000" when the split was chosen).
+#[cfg(windows)]
+fn past_the_host(from: usize, to: usize, start: usize, step: u64, (mirrored, count): (u32, u32), page: &[u8], highest_looked: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    PAST_THE_HOST[3].store(u64::from(mirrored), Relaxed);
+    let before = PAST_THE_HOST[0].fetch_max(highest_looked, Relaxed);
+    if mirrored >= count {
+        return;
+    }
+    let step = step as usize;
+    let first = (from - start).div_ceil(step).max(mirrored as usize);
+    let last = ((to - start) / step).min(count as usize);
+    let (mut found, mut highest) = (0u64, 0u64);
+    for index in first..last {
+        let at = start + index * step - from;
+        if page.get(at..at + step).is_some_and(|record| record.iter().any(|&b| b != 0)) {
+            found += 1;
+            highest = index as u64 + 1;
+        }
+    }
+    if found == 0 {
+        // Said as the title's records climb towards the host's last title slot.
+        if highest_looked > before && highest_looked / 16_384 != before / 16_384 {
+            tracing::info!(
+                "the title's view heap: the highest slot on a page it changed so far is {} (the host heap has title slots below {mirrored}; \
+                 the title's heap has {count})",
+                highest_looked.saturating_sub(1)
+            );
+        }
+        return;
+    }
+    let seen = PAST_THE_HOST[1].fetch_add(found, Relaxed);
+    let top = PAST_THE_HOST[2].fetch_max(highest, Relaxed);
+    if seen == 0 || highest > top {
+        tracing::warn!(
+            "the title wrote view records at slots the host heap has no title slot for: {found} on this page, the highest slot {} \
+             ({} such records seen so far; the host heap has title slots below {mirrored}, and its slots from there to 999,998 hold \
+             per-draw tables: a shader that picks a view by one of these indices reads a table's slot, whatever it holds)",
+            highest - 1,
+            seen + found
+        );
     }
 }
 

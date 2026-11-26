@@ -491,6 +491,16 @@ pub(crate) fn log_removal_context() {
     // The memory at this moment: the memory line is up to five seconds
     // old, and a card or a PC out of memory would not be in it.
     tracing::error!("memory when the host device went: {}", removal_memory());
+    #[cfg(windows)]
+    {
+        let [looked, past, top, mirrored] = [0, 1, 2, 3].map(|i| crate::descriptor::PAST_THE_HOST[i].load(Ordering::Relaxed));
+        tracing::error!(
+            "the title's view heap when the host device went: the highest slot on a page it changed {}; records it wrote at slots \
+             the host heap has no title slot for (from {mirrored} on): {past} seen, the highest slot {}",
+            looked.saturating_sub(1),
+            if top == 0 { "none".to_owned() } else { (top - 1).to_string() }
+        );
+    }
     if let Some(host) = host() {
         match host.video_memory_groups() {
             Some(_) => host.log_video_memory("where the removal was found"),
