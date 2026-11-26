@@ -100,6 +100,19 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// The runtime's changes of what title memory shows, by part
+    /// (`victory-hle` `xmem.rs`): microseconds in the system's unmapping
+    /// calls, in its mapping calls (the split of the placeholder and the
+    /// mapping itself), in committing, and in the layer's own notes of the
+    /// change (`title_memory_remapped`, `title_memory_view`); then the views
+    /// that reached outside the range asked for and were mapped again there,
+    /// and those bytes.
+    RemapUnmapUs,
+    RemapMapUs,
+    RemapCommitUs,
+    RemapNotesUs,
+    RemapCuts,
+    RemapCutBytes,
     Count,
 }
 
@@ -412,7 +425,8 @@ fn text(f: &Frame) -> String {
          send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
-         readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
+         readers; of it the system's unmapping {:.1}, its mapping {:.1}, committing {:.1}, our own notes of the change \
+         {:.1}; {:.0} views cut, {:.1} MB of them mapped again) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
          faults: {:.0} page, {:.0} guard | process: {:.0} user {:.0} kernel ms | pacing, all threads {:.1} ms | {:.0} \
          draws | {:.0} MB free | found on a slow core: the render thread {:.0} of {:.0} looks, the submit thread {:.0} of {:.0}, recording threads {:.0} of {:.0}",
         f.us / 1e3,
@@ -454,6 +468,12 @@ fn text(f: &Frame) -> String {
         t(T::Remaps),
         ms(T::RemapUs),
         ms(T::RemapWaitUs),
+        ms(T::RemapUnmapUs),
+        ms(T::RemapMapUs),
+        ms(T::RemapCommitUs),
+        ms(T::RemapNotesUs),
+        t(T::RemapCuts),
+        t(T::RemapCutBytes) / (1 << 20) as f64,
         s(S_PIPELINES_MADE),
         s(S_PIPELINES_LOADED),
         ms(T::PipelineWaitUs),
