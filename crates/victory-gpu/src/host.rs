@@ -1080,6 +1080,10 @@ struct Gather {
     /// gathered from here on (the ones gathered before are read before
     /// the list runs, which is before that).
     closed: bool,
+    /// With `crate::indirect::gather_by_copy`: the host copies (their
+    /// numbers) the list's shaders were declared to write so far
+    /// (`Shadow::gpu_writes`): no record of those is gathered from then on.
+    written: std::collections::HashSet<u64>,
     /// One set per argument buffer, kind and stride.
     sets: Vec<crate::indirect::GatherSet>,
     /// The budget words the gathered records are charged to.
@@ -6722,8 +6726,9 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-            let Gather { closed, sets, spare, .. } = &mut *gather;
+            let Gather { closed, written, sets, spare, .. } = &mut *gather;
             *closed = false;
+            written.clear();
             for set in sets.drain(..) {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
@@ -7191,6 +7196,17 @@ impl HostList {
         self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
     }
 
+    /// Shaders of the list were declared to write the host copy numbered
+    /// `copy` (`Shadow::gpu_writes`): with
+    /// `crate::indirect::gather_by_copy`, no record of that copy is
+    /// gathered from here on. (Without the switch nothing is noted: the
+    /// list stops gathering whole, as before.)
+    pub(crate) fn gather_wrote(&self, copy: u64) {
+        if crate::indirect::gather_by_copy_kept() {
+            self.gather.lock().unwrap_or_else(|e| e.into_inner()).written.insert(copy);
+        }
+    }
+
     /// A slot for the record at `offset` of the host copy `src` in the
     /// scratch buffer the list's prelude fills (`crate::indirect::gather`,
     /// which checked the record): the buffer and the slot's place in it.
@@ -7200,7 +7216,7 @@ impl HostList {
             None
         };
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        if gather.closed {
+        if gather.closed || gather.written.contains(&src_id) {
             return none(1);
         }
         let found = gather
