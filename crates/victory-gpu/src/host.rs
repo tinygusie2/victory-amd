@@ -6598,6 +6598,17 @@ impl Host {
         }
     }
 
+    /// Whether the host device is a software adapter (WARP: the checks'
+    /// machine has no card, and tests of what only a card does skip there).
+    #[cfg(test)]
+    pub(crate) fn software(&self) -> bool {
+        // SAFETY: a plain query.
+        self.adapter
+            .as_ref()
+            .and_then(|a| unsafe { a.GetDesc1() }.ok())
+            .is_some_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+    }
+
     /// The host device (`crate::cardmeter`).
     pub(crate) fn device(&self) -> &ID3D12Device {
         &self.device

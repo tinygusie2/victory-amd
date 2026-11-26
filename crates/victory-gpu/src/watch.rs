@@ -1911,12 +1911,17 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
-        assert!(before.is_empty());
+        // (Not empty by rule: the journal is the process's and keeps what
+        // was written at an address for good, and a fresh allocation can
+        // land where another test's freed one stood; that failed this test
+        // now and then. Nothing written since the allocation is new.)
+        let (asked, before) = writes(start, end, false).expect("watched");
+        assert!(before.iter().all(|&(_, at)| at < asked), "a fresh allocation has no page written at this asking");
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
         let (now, after) = writes(start, end, false).expect("watched");
-        assert_eq!(after, [(p / PAGE + 1, now)]);
+        let new: Vec<(usize, u64)> = after.iter().copied().filter(|entry| !before.contains(entry)).collect();
+        assert_eq!(new, [(p / PAGE + 1, now)], "the written page, and no other, is new at this asking");
         // Another asker after the kernel's bit was cleared still sees it.
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);

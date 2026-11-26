@@ -1400,6 +1400,14 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        // The software adapter says it supports the depth-bounds test and
+        // then lets every pixel through (the same draw: 255 where a card
+        // gives 0; seen on the checks' machine and here with
+        // VICTORY_D3D12_WARP=1). What the test asks is the card's part.
+        if host.software() {
+            eprintln!("the software adapter does not apply depth bounds; skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
