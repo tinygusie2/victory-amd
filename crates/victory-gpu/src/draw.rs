@@ -405,6 +405,10 @@ pub(crate) struct State {
     root_uav_slots: std::collections::HashMap<(usize, u64), RootSlot>,
     /// The list ran and its dynamic slots were given back.
     tables_gone: bool,
+    /// Diagnostics: the number of this recording of the list, by which the
+    /// tables it makes twice are told ([`table_asked`]); 0 until its first.
+    #[cfg(feature = "diagnostics")]
+    recording: u64,
 }
 
 impl Drop for State {
@@ -438,7 +442,237 @@ impl State {
         self.root_srv_slots.clear();
         self.root_uav_slots.clear();
         self.tables_gone = true;
+        #[cfg(feature = "diagnostics")]
+        {
+            self.recording = 0;
+        }
     }
+}
+
+/// Diagnostics, since the last line ([`tables_line`]): the descriptor tables
+/// draws and dispatches have made afresh ([`State::tables`]).
+/// 0: tables asked of the list's own memory of them (`fresh_tables`); 1: of
+/// them, found there (the same table holding the same records). The others
+/// are made, and each is counted once in 2 to 7 or in none of them:
+/// 2: its records are those of a table this recording of the list made
+/// before, at another address; 6: not that, but they differ from such a
+/// table's only in where the constants are; 3, 4, 5: neither, but its
+/// records are those of a table some list made earlier in this frame, in
+/// the frame before, 2 to 8 frames before; 7: none of those, but they
+/// differ only in where the constants are from a table made in this frame
+/// or the 8 before.
+/// 8 to 11: the tables to make by their slots (1, 2 to 4, 5 to 16, more);
+/// 12: those slots; 13 to 16: the slots made as a constant view, a texture
+/// view, another view (buffers), a null view; 17: entries made readable in
+/// tables made; 18: in tables found; 19: entries of tables that are not
+/// made afresh ([`State::table_entry`]: the title's own slots).
+/// 20: tables timed (one in 16 of each thread); their nanoseconds: 21
+/// finding the slots (`HostHeap::dynamic`), 22 looking the views up and
+/// making them, 23 making entries readable, 24 the title's own slots of
+/// texture views (`HostHeap::texture_slot_tabled`, `HostHeap::mirror`).
+/// 25: tables to make that found no slots.
+#[cfg(feature = "diagnostics")]
+static TABLES: [AtomicU64; 26] = [const { AtomicU64::new(0) }; 26];
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// This thread's counts for [`TABLES`] not yet added to it, and its
+    /// calls of [`State::tables`] since they last were.
+    static TALLY: std::cell::RefCell<([u64; 26], u32)> = const { std::cell::RefCell::new(([0; 26], 0)) };
+    /// This thread's tables to make, for timing one in 16.
+    static TABLES_MADE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Diagnostics: `n` more of count `at` of [`TABLES`], kept by the thread
+/// until [`tally_done`] (no shared memory is written here).
+#[cfg(feature = "diagnostics")]
+fn tally(at: usize, n: u64) {
+    TALLY.with(|t| t.borrow_mut().0[at] += n);
+}
+
+/// Diagnostics: a call of [`State::tables`] ends; every 64th of a thread
+/// adds the thread's counts to [`TABLES`].
+#[cfg(feature = "diagnostics")]
+fn tally_done() {
+    TALLY.with(|t| {
+        let t = &mut *t.borrow_mut();
+        t.1 += 1;
+        if t.1 < 64 {
+            return;
+        }
+        t.1 = 0;
+        for (total, sum) in TABLES.iter().zip(t.0.iter_mut()) {
+            if *sum != 0 {
+                total.fetch_add(std::mem::take(sum), Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Diagnostics: the clock of a timed table: each lap goes to a count of
+/// [`TABLES`]. Without a clock (15 tables of 16) a lap does nothing.
+#[cfg(feature = "diagnostics")]
+struct Lap(Option<std::time::Instant>);
+
+#[cfg(feature = "diagnostics")]
+impl Lap {
+    /// The time since the lap before (or the start) goes to count `at`.
+    fn lap(&mut self, at: usize) {
+        if let Some(last) = &mut self.0 {
+            let now = std::time::Instant::now();
+            tally(at, now.duration_since(*last).as_nanos() as u64);
+            *last = now;
+        }
+    }
+}
+
+/// Diagnostics: slots of each of the four parts of [`seen`].
+#[cfg(feature = "diagnostics")]
+const SEEN_SLOTS: usize = 1 << 19;
+
+/// Diagnostics: where the fingerprints of the tables made are kept
+/// ([`table_asked`]): four parts of [`SEEN_SLOTS`] slots, each slot the
+/// last fingerprint that fell on it. Made at the first table (16 MB).
+#[cfg(feature = "diagnostics")]
+fn seen() -> &'static [AtomicU64] {
+    static SEEN: std::sync::OnceLock<Box<[AtomicU64]>> = std::sync::OnceLock::new();
+    SEEN.get_or_init(|| (0..4 * SEEN_SLOTS).map(|_| AtomicU64::new(0)).collect())
+}
+
+/// Diagnostics: counts the table of `n` records at `table` that a list in
+/// its recording number `recording` (given one here if it has none) is
+/// about to make, by where the same records were seen before ([`TABLES`] 2
+/// to 12), and starts the clock of one table in 16.
+///
+/// A table is told by a fingerprint of its records
+/// (`crate::descriptor::host::table_prints`), and a fingerprint is found
+/// again only while no other has fallen on its slot since: the counts of
+/// tables seen before are lower bounds. With 30,000 tables a frame on
+/// 524,288 slots, about 6% of the tables last made a whole frame ago are
+/// missed, fewer of the nearer ones.
+#[cfg(feature = "diagnostics")]
+fn table_asked(recording: &mut u64, table: u64, n: u32) -> Lap {
+    const K: u64 = 0x9e37_79b9_7f4a_7c15;
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    if *recording == 0 {
+        *recording = NEXT.fetch_add(1, Ordering::Relaxed);
+    }
+    let (whole, shape) = crate::descriptor::host::table_prints(table, n);
+    let seen = seen();
+    let mix = |v: u64| {
+        let v = v.wrapping_mul(K);
+        v ^ (v >> 31)
+    };
+    // In this recording of this list: the slot holds the fingerprint mixed
+    // with the recording's number.
+    let own = recording.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    let in_list = |part: usize, print: u64| {
+        let tag = mix(print ^ own) | (1 << 63);
+        let slot = &seen[part * SEEN_SLOTS + (tag as usize & (SEEN_SLOTS - 1))];
+        slot.swap(tag, Ordering::Relaxed) == tag
+    };
+    // By any list: the slot holds the fingerprint's high half and the frame
+    // it was last seen in. The frames since then, if it is there.
+    let frame = crate::frame::current() as u32;
+    let frames_ago = |part: usize, print: u64| {
+        let tag = mix(print);
+        let slot = &seen[part * SEEN_SLOTS + (tag as usize & (SEEN_SLOTS - 1))];
+        let was = slot.swap((tag & !0xffff_ffff) | u64::from(frame), Ordering::Relaxed);
+        (was != 0 && was >> 32 == tag >> 32).then(|| frame.wrapping_sub(was as u32))
+    };
+    // All four are noted for every table, whichever it is counted as.
+    let (list_whole, list_shape) = (in_list(0, whole), in_list(1, shape));
+    let (ago_whole, ago_shape) = (frames_ago(2, whole), frames_ago(3, shape));
+    let class = if list_whole {
+        Some(2)
+    } else if list_shape {
+        Some(6)
+    } else {
+        match (ago_whole, ago_shape) {
+            (Some(0), _) => Some(3),
+            (Some(1), _) => Some(4),
+            (Some(2..=8), _) => Some(5),
+            (_, Some(0..=8)) => Some(7),
+            _ => None,
+        }
+    };
+    if let Some(class) = class {
+        tally(class, 1);
+    }
+    tally(
+        match n {
+            1 => 8,
+            2..=4 => 9,
+            5..=16 => 10,
+            _ => 11,
+        },
+        1,
+    );
+    tally(12, u64::from(n));
+    let timed = TABLES_MADE.with(|made| {
+        made.set(made.get().wrapping_add(1));
+        made.get().is_multiple_of(16)
+    });
+    if timed {
+        tally(20, 1);
+    }
+    Lap(timed.then(std::time::Instant::now))
+}
+
+/// Diagnostics, with the line of the recording: the tables made afresh
+/// ([`TABLES`]) and the host heap's locks (`crate::descriptor::host::LOCKS`),
+/// per frame over `frames` frames.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tables_line(frames: f64) {
+    let frames = frames.max(1.0);
+    let t: Vec<f64> = TABLES.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let l: Vec<f64> = crate::descriptor::host::LOCKS.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let (asked, found) = (t[0], t[1]);
+    let to_make = asked - found;
+    let (in_list, in_list_but_constants) = (t[2], t[6]);
+    let (this_frame, frame_before, older, but_constants) = (t[3], t[4], t[5], t[7]);
+    let new = to_make - t[2..8].iter().sum::<f64>();
+    let (one, to_4, to_16, more, slots) = (t[8], t[9], t[10], t[11], t[12]);
+    let (constants, textures, others, nulls) = (t[13], t[14], t[15], t[16]);
+    let (readable_made, readable_found, entries) = (t[17], t[18], t[19]);
+    // One table in 16 was timed: the milliseconds of all of them, at that rate.
+    let timed = t[20];
+    let all = |ns: f64| if timed > 0.0 { ns / timed * to_make / 1e6 } else { 0.0 };
+    let (finding, views, readable, title) = (all(t[21]), all(t[22]), all(t[23]), all(t[24]));
+    let refused = t[25];
+    tracing::info!(
+        "descriptor tables per frame ({frames:.0} frames; counts of a thread join after 64 of its binds): {asked:.0} asked of their list's \
+         memory, {found:.0} found there; of the {to_make:.0} to make: {in_list:.0} hold the records of a table made earlier in the same \
+         recording of their list at another address (a table cache within a list would serve these), {in_list_but_constants:.0} more \
+         differ from one only in where their constants are; of the rest {this_frame:.0} hold the records of a table another list made \
+         earlier in the frame, {frame_before:.0} of one made the frame before, {older:.0} of one made 2 to 8 frames before, \
+         {but_constants:.0} more differ from one of those only in where their constants are; {new:.0} are new (the counts of repeats \
+         are lower bounds); {refused:.0} found no slots; tables of 1 slot {one:.0}, of 2 to 4 {to_4:.0}, of 5 to 16 {to_16:.0}, of more \
+         {more:.0}; {slots:.0} slots: {constants:.0} constant views, {textures:.0} texture views, {others:.0} other views, {nulls:.0} null; \
+         entries made readable {readable_made:.0} in tables made, {readable_found:.0} in tables found, {entries:.0} entries of tables \
+         not made afresh; one table in 16 timed ({timed:.0}), all of them at that rate: {finding:.1} ms finding slots, {views:.1} ms \
+         looking up and making views, {readable:.1} ms making entries readable, {title:.1} ms on the title's own slots of textures"
+    );
+    let (mirrors_other, mirrors_draw) = (l[0], l[1]);
+    let (changed_other, changed_draw) = (l[2], l[3]);
+    let (made_waits, made_waited) = (l[4], l[5] / 1e6);
+    // One call in 16 was timed: the mean of those, and all calls at that mean.
+    let mean = |ns: f64, n: f64| if n > 0.0 { ns / n } else { 0.0 };
+    let (same_ns, changed_ns) = (mean(l[6], l[8]), mean(l[7], l[9]));
+    let changed = changed_other + changed_draw;
+    let same_ms = same_ns * (mirrors_other + mirrors_draw - changed) / 1e6;
+    let changed_ms = changed_ns * changed / 1e6;
+    let (keeps, kept_waits, kept_waited) = (l[10], l[11], l[12] / 1e6);
+    let (next_waits, next_waited) = (l[13], l[14] / 1e6);
+    tracing::info!(
+        "the host heap's locks per frame, all threads: the slots' lock (HostHeap::mirror) taken {mirrors_draw:.0} times for draws \
+         ({changed_draw:.0} found the slot's record changed) and {mirrors_other:.0} times for writes and the pass over copied records \
+         ({changed_other:.0} changed); {made_waits:.0} takes found it held and waited {made_waited:.2} ms in all (every wait timed); it \
+         was held {same_ns:.0} ns a call where the slot was as it was and {changed_ns:.0} ns where it had changed (one call in 16 timed), \
+         {same_ms:.1} ms and {changed_ms:.1} ms for all calls at those means; the lock of the resources slots hold (HostHeap::keep) \
+         taken {keeps:.0} times, {kept_waits:.0} found it held and waited {kept_waited:.2} ms; the lock of the dynamic slots \
+         (HostHeap::dynamic; its takes are the line above's tables asked): {next_waits:.0} found it held and waited {next_waited:.2} ms"
+    );
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
@@ -2856,6 +3090,8 @@ impl State {
         let (Some(host), Some(index)) = (heap.host(), heap.index(handle)) else {
             return;
         };
+        #[cfg(feature = "diagnostics")]
+        tally(19, 1);
         if let Some(view) = host.mirror(index, handle, true) {
             readable(list, u.kind, &view);
             // Up to date by this draw: not the texture pass's to make.
@@ -2978,11 +3214,17 @@ impl State {
                 }
                 (table, n, h.finish())
             };
+            #[cfg(feature = "diagnostics")]
+            tally(0, 1);
             if let Some(&first) = self.fresh_tables.get(&key) {
+                #[cfg(feature = "diagnostics")]
+                tally(1, 1);
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
                     if let Some(view) = crate::descriptor::view(handle) {
                         readable(list, u.kind, &view);
+                        #[cfg(feature = "diagnostics")]
+                        tally(18, 1);
                     }
                 }
                 for k in selected {
@@ -2994,17 +3236,25 @@ impl State {
                         && let Some(kind) = view_kind(&view)
                     {
                         readable(list, kind, &view);
+                        #[cfg(feature = "diagnostics")]
+                        tally(18, 1);
                     }
                 }
                 made.push((slot, first * 32));
                 continue;
             }
+            #[cfg(feature = "diagnostics")]
+            let mut clock = table_asked(&mut self.recording, table, n);
             let Some(first) = host.dynamic(n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
+                #[cfg(feature = "diagnostics")]
+                tally(25, 1);
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            clock.lap(21);
             self.fresh_tables.insert(key, first);
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -3024,14 +3274,29 @@ impl State {
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            tally(13, 1);
+                            clock.lap(22);
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            tally(if crate::descriptor::host::is_texture_view(&view) { 14 } else { 15 }, 1);
+                            clock.lap(22);
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
                         if let Some(kind) = kind {
                             readable(list, kind, &view);
+                            #[cfg(feature = "diagnostics")]
+                            {
+                                tally(17, 1);
+                                clock.lap(23);
+                            }
                         }
                         // The title's slot is a table's: out of the queue
                         // of textures picked by index if the draw read it
@@ -3045,10 +3310,17 @@ impl State {
                             if kind.is_some() {
                                 host.mirror(title + k, table + u64::from(k) * 32, true);
                             }
+                            #[cfg(feature = "diagnostics")]
+                            clock.lap(24);
                         }
                     }
                     None => {
                         host.make_null(index);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            tally(16, 1);
+                            clock.lap(22);
+                        }
                         if used.is_some() {
                             once!(slot, "a table entry without a view");
                         }
@@ -3057,6 +3329,8 @@ impl State {
             }
             made.push((slot, first * 32));
         }
+        #[cfg(feature = "diagnostics")]
+        tally_done();
         made
     }
 
