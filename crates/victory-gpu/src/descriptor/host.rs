@@ -2756,12 +2756,14 @@ fn twin_uav(
 /// a constant view, so nothing it can read is lost.
 fn constant_view_size(size: u32) -> u32 {
     const MOST: u32 = 4096 * 16;
-    let sized = size.max(1).next_multiple_of(256);
-    if sized > MOST {
+    // The cap before the rounding (fork pull request #1206): a size within
+    // 255 of the largest number would round past it, to 0 in a release
+    // build, and a view of no bytes be made with no line said.
+    if size > MOST {
         once!(size, "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)");
         return MOST;
     }
-    sized
+    size.max(1).next_multiple_of(256)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -3183,6 +3185,9 @@ mod tests {
         assert_eq!(constant_view_size(256), 256);
         assert_eq!(constant_view_size(65_536), 65_536);
         assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
