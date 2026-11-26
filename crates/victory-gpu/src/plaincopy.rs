@@ -413,11 +413,11 @@ mod tests {
         for len in [1usize, 16, 64, 255] {
             let mut to = vec![0u8; len];
             // The page's last bytes.
-            assert!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len), len), "{len}");
+            assert!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len), len) == 0, "{len}");
             assert_eq!(to, page[PAGE - len..], "{len}");
             // One byte into the hole.
             let mut to = vec![0u8; len];
-            assert!(!guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len + 1), len), "{len}");
+            assert!(guarded(to.as_mut_ptr(), base.wrapping_add(PAGE - len + 1), len) != 0, "{len}");
             assert_eq!(to[..len - 1], page[PAGE - len + 1..], "{len}: the bytes before the hole");
         }
         // SAFETY: the test's reservation.

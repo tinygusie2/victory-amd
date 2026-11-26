@@ -4371,7 +4371,7 @@ fn tables_changed() {
 
 #[cfg(test)]
 mod registration_tests {
-    use super::{TABLES_CHANGED, buffers, register, unregister};
+    use super::{TABLES_CHANGED, buffers_read, register, unregister};
     use std::sync::{Barrier, atomic::Ordering};
     use std::time::{Duration, Instant};
 
@@ -4384,7 +4384,7 @@ mod registration_tests {
         let slot = 0u64;
         let start = (&raw const slot) as u64;
         let resource = start as usize;
-        let table = buffers();
+        let table = buffers_read();
         let initial = TABLES_CHANGED.load(Ordering::Acquire);
         let ready = Barrier::new(2);
         let observed = std::thread::scope(|scope| {
