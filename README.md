@@ -30,10 +30,11 @@ developer or publisher.
 
 ## Status of this fork (2026-11-26, 00:00 UTC)
 
-**Playable for half an hour at a time, slowly: about 9 to 12 frames per second (the console runs
+**Playable for half an hour at a time, slowly: about 7 to 12 frames per second (the console runs
 30). The tester has played from the opening through the prologue and past the first boat mission.
-Then the graphics card is lost (three times in sessions of 6, 49 and 31 minutes; cause not known
-yet). Shadowed areas are still black.**
+Then the graphics card is lost: four times, in sessions of 6, 49, 31 and 38 minutes, the last three
+on the way to the same place in the story, before the title's next save point. Cause not known
+yet. Shadowed areas are still black.**
 Tested on one machine: Windows 11, Intel i7-14700KF, NVIDIA RTX 4070 12 GB,
 32 GB RAM. The Series X profile is used throughout.
 
@@ -77,6 +78,12 @@ numbers are estimates until a run carries them.**
   card's memory at that moment and the card's peak use since the last line (the memory line was
   one look in five seconds); a line a second with the peak (`VICTORY_VIDEO_LOOK=0`: none); and
   what Present answers, which was thrown away.
+- **The fourth loss (38 minutes in, with `VICTORY_D3D12_DRED=faults`)**: removal reason 0x887A0005
+  again, and the runtime reported no page fault address, so it was not the card reading freed or
+  unmapped memory. The three long sessions all ended on the way to the same place in the story,
+  so the trigger looks tied to what is drawn or made there, not to the time played. Nothing in the
+  last seconds of the three logs is found only there (pipelines made, textures made). The tracing
+  cost nothing measurable up to 4,000 draws a frame.
 - **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
   the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
   with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
