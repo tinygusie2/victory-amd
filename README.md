@@ -1,3 +1,27 @@
+# victory-amd (r13)
+
+A build of [VIctory](https://github.com/Marvisak/VIctory) for **AMD cards**, merged from
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork) with local fixes.
+**No game files, saves or binaries are in this repository**; you need your own copy of the game.
+
+**Tested on one machine: Windows 11, AMD Ryzen 5 7500F, AMD Radeon RX 9060 XT 16 GB (RDNA 4,
+driver 32.0.32029.2010), 32 GB DDR5-6000, 2560x1440 monitor. The Series X profile is used.**
+
+What this build changes for AMD:
+- `VICTORY_BIT_EXACT_VIEWS` is **off** by default: integer typed buffer views made as float views
+  turned lit skin black on this card.
+- Constant buffer slots are marked as such in the descriptor tables (an AMD fix), large compute
+  programs are skipped (`VICTORY_MAX_COMPUTE_KB=48`), and pipelines that crash AMD's shader
+  compiler are listed in `scripts/start.ps1`.
+- Settings and start scripts measured on this PC: see [`scripts/`](scripts/README.md).
+  `VICTORY_DISPLAY_MODE=2560x1440` tells the title the monitor's size instead of 4K.
+
+Frame rates measured here: about 3-5 fps in the open world (200-300 ms a frame), lower than the
+NVIDIA figures below. The rest of this file is fxceless's README, measured on **his** NVIDIA
+machine; its numbers do not hold for AMD.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
