@@ -33,6 +33,9 @@ pub(crate) struct Pending {
     /// whether a draw or dispatch has requested it yet.
     key: String,
     used: AtomicBool,
+    /// Whether the made pipeline has gone to a draw or dispatch yet
+    /// (`crate::host::first_use`: for a device removal's report).
+    handed: AtomicBool,
     /// The formats its state declares for what a draw draws into (zeros
     /// without a graphics state).
     pub(crate) formats: TargetFormats,
@@ -65,6 +68,7 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            handed: AtomicBool::new(false),
         }
     }
 
@@ -136,7 +140,16 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p, REQUESTED);
         wait(p, crate::frame::current());
     }
-    p.made.get()?.as_ref()
+    let made = p.made.get()?.as_ref();
+    // The first time the made pipeline goes to a draw or dispatch: noted
+    // for a device removal's report (one load a call after that).
+    if let Some(host) = made
+        && !p.handed.load(Ordering::Relaxed)
+        && !p.handed.swap(true, Ordering::Relaxed)
+    {
+        crate::host::first_use(&host.name);
+    }
+    made
 }
 
 /// Pipelines made again for the formats bound at a draw, since the start.

@@ -618,6 +618,35 @@ pub fn frame() {
     for line in lines(&frames, usual, elapsed.as_secs_f64()) {
         tracing::info!("{line}");
     }
+    tracing::info!("{}", kinds(&frames));
+}
+
+/// Host submissions a frame from which a frame counts as one of the world:
+/// the title's frame there is a burst (9 to 12 host submissions at the boat
+/// save, 29 in the first rooms); its menus, fades and loading screens send
+/// two or three and run at the title's own 30 a second.
+const WORLD_SUBMISSIONS: f64 = 6.0;
+
+/// One more line of a reading: the frames of the world apart from the
+/// others, each kind with its own time. A run's frames a second over "the
+/// world phase" counted both: runs 306 and 308 (the boat save) read 9.1 and
+/// 9.6 a second with 6.7 and 6.2 in the world's own frames, and run 309
+/// read 9.3 with 8.7 there, so a gain of a third looked like none.
+fn kinds(frames: &[Frame]) -> String {
+    let (world, other): (Vec<&Frame>, Vec<&Frame>) =
+        frames.iter().partition(|f| f.t[T::Submissions as usize] >= WORLD_SUBMISSIONS);
+    let sum = |v: &[&Frame]| v.iter().map(|f| f.us).sum::<f64>();
+    let (w, o) = (sum(&world), sum(&other));
+    format!(
+        "frames by kind: {} of the world ({WORLD_SUBMISSIONS:.0} or more host submissions) in {:.1} s: mean {:.0} ms, {:.2} a second while they ran; {} menu or loading frames (fewer submissions) in {:.1} s: mean {:.0} ms",
+        world.len(),
+        w / 1e6,
+        w / 1e3 / world.len().max(1) as f64,
+        world.len() as f64 * 1e6 / w.max(1.0),
+        other.len(),
+        o / 1e6,
+        o / 1e3 / other.len().max(1) as f64
+    )
 }
 
 #[cfg(test)]
