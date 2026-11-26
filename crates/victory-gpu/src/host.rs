@@ -2347,6 +2347,14 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// With [`list_reuse`]: the host pipelines the list has kept, by
+    /// address ([`HostList::first_bind`]).
+    bound: std::collections::HashSet<usize>,
+    /// With [`list_reuse`]: upload memory filled from title memory since
+    /// the last title copy (source, bytes): its host GPU address, which a
+    /// second fill would find holding the same bytes
+    /// ([`HostList::fill_scratch`]).
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
@@ -7432,6 +7440,33 @@ impl HostList {
         }
     }
 
+    /// With [`list_reuse`]: whether this is the first time since the reset
+    /// that the list binds the host pipeline at `pipeline` (its interface
+    /// pointer). The list keeps the pipeline from its first bind to its
+    /// reset, so the address names the same one until then, and a later
+    /// bind need not keep it and its root signature again.
+    pub(crate) fn first_bind(&self, pipeline: usize) -> bool {
+        self.deferred().bound.insert(pipeline)
+    }
+
+    /// With [`list_reuse`]: the host GPU address of `len` bytes of upload
+    /// memory holding the title memory at `src` as of the list's
+    /// submission: one copy for every ask until a `Copy` or `Run` step
+    /// intervenes (every fill reads at the submission, in step order, so a
+    /// second fill of the same bytes with neither between them would read
+    /// what the first did).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let found = self.deferred().filled.get(&key).copied();
+        if let Some(gpu) = found {
+            return Some(gpu);
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -7456,6 +7491,9 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        if list_reuse_set() {
+            deferred.filled.clear();
+        }
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7784,6 +7822,9 @@ impl HostList {
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
         self.deferred().copies.push(Step::Run(Box::new(work)));
         self.deferred().refreshed.clear();
+        if list_reuse_set() {
+            self.deferred().filled.clear();
+        }
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8164,6 +8205,49 @@ impl Batch {
         }
         if ahead {
             crate::watch::ask_ahead_done();
+        }
+    }
+}
+
+/// What `VICTORY_LIST_REUSE` says: 0 unset (off), 1 on, 2 in turn.
+fn list_reuse_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_LIST_REUSE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    })
+}
+
+/// Whether the switch is set at all (`1` or `alt`): what a list remembers
+/// of its fills is then dropped at every `Copy` and `Run` step in both
+/// phases of `alt`, so that nothing remembered in one ON phase is wrong in
+/// the next.
+fn list_reuse_set() -> bool {
+    list_reuse_mode() != 0
+}
+
+/// Whether a list keeps a pipeline it binds once, and copies a root view's
+/// title memory into upload memory once for every bind of the same bytes
+/// (`VICTORY_LIST_REUSE=1`; off by default: kept and copied at every bind,
+/// as before). `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log. After darkworldhm's snapshot
+/// (`HostList::bind_pipeline`, `HostList::fill_scratch` there).
+pub(crate) fn list_reuse() -> bool {
+    match list_reuse_mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a list keeps a pipeline once and copies a repeated root view once from now (VICTORY_LIST_REUSE=alt): {}",
+                    if on { "ON" } else { "off, at every bind as usual" }
+                );
+            }
+            on
         }
     }
 }

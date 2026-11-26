@@ -961,7 +961,61 @@ pub(crate) fn forget(resource: usize) {
         // The view's other resource (a counter) keeps a stale entry, which
         // `forget` of that resource skips.
         views.free.push(i);
+        if crate::heap_pass::marked_set() {
+            note_forgotten(i);
+        }
     }
+}
+
+/// With `VICTORY_HEAP_PASS_MARKED` (`crate::heap_pass`): table entries
+/// freed since the pass over the heap's buffer views last asked
+/// ([`take_forgotten`]): records that name them read nothing now, though no
+/// slot was written. Kept only once a pass has asked.
+static FORGOTTEN: std::sync::Mutex<(bool, bool, Vec<u32>)> = std::sync::Mutex::new((false, false, Vec::new()));
+
+/// More entries than this between two asks: the list is dropped, and the
+/// next ask is told it does not know.
+const FORGOTTEN_MOST: usize = 1 << 20;
+
+fn note_forgotten(i: u32) {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    if !*asked || *overflowed {
+        return;
+    }
+    if list.len() >= FORGOTTEN_MOST {
+        *overflowed = true;
+        *list = Vec::new();
+        return;
+    }
+    list.push(i);
+}
+
+/// The table entries freed since the last call (in any order, maybe
+/// twice); `None` on the first call and when too many were to be kept.
+pub(crate) fn take_forgotten() -> Option<Vec<u32>> {
+    let mut forgotten = FORGOTTEN.lock().unwrap_or_else(|e| e.into_inner());
+    let (asked, overflowed, list) = &mut *forgotten;
+    let known = *asked && !*overflowed;
+    *asked = true;
+    *overflowed = false;
+    let list = std::mem::take(list);
+    known.then_some(list)
+}
+
+/// The record at `handle` (a descriptor slot in title memory): its tag and
+/// two words, read as they are.
+pub(crate) fn record_at(handle: u64) -> [u32; 3] {
+    // SAFETY: the handle is a descriptor slot in title memory, at least 16
+    // bytes.
+    unsafe { (handle as *const [u32; 3]).read_unaligned() }
+}
+
+/// The view table entry a record names, if it names one (not a view named
+/// whole in its record, not a record of no view).
+pub(crate) fn record_entry(record: [u32; 3]) -> Option<u32> {
+    let [tag, i, generation] = record;
+    (tag == VIEW_TAG && generation >> KIND_SHIFT == 0).then_some(i)
 }
 
 /// The view the record words `i` and `generation` name: the one they hold

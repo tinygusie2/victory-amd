@@ -530,6 +530,17 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// Passes over the view heap's buffer views for shaders that pick them by
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
+/// Per host heap, for [`State::heap_buffers`]: its passes so far, and the
+/// host copy and range each slot's buffer view reads. (At the module's
+/// level so that the marked pass can have this one start anew:
+/// [`State::heap_buffers_marked`].)
+type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
+    std::sync::Mutex::new(None);
+/// Per host heap, for [`State::heap_buffers_marked`]: what the marked pass
+/// keeps (`VICTORY_HEAP_PASS_MARKED`; nothing while that is unset).
+type Marked = crate::heap_pass::Picked<std::sync::Arc<crate::shadow::Shadow>>;
+static MARKED: std::sync::Mutex<Option<std::collections::HashMap<usize, Marked>>> = std::sync::Mutex::new(None);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`], the microseconds of the pass over textures
 /// picked by index that runs inside it (`heap_textures`), and the buffer
@@ -643,6 +654,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
+    }
+    if crate::host::list_reuse() {
+        return list.fill_scratch(address as *const u8, len);
     }
     let (gpu, to) = list.scratch(len)?;
     list.defer_fill(to, address as *const u8, len as usize);
@@ -1170,8 +1184,11 @@ impl State {
             self.host_pipeline = p.pso.as_raw() as usize;
             list.used_pipeline(&p.name);
             // The title may release the pipeline before it submits the list.
-            list.keep(&p.pso);
-            list.keep(&p.root);
+            // (`VICTORY_LIST_REUSE`: kept at the list's first bind of it only.)
+            if !crate::host::list_reuse() || list.first_bind(p.pso.as_raw() as usize) {
+                list.keep(&p.pso);
+                list.keep(&p.root);
+            }
         }
         for stage in &p.stages {
             let t = stage.translated();
@@ -1572,6 +1589,17 @@ impl State {
         if FRAME.swap(frame, Ordering::Relaxed) == frame {
             return Some(gpu);
         }
+        // `VICTORY_HEAP_PASS_MARKED` (off unless set): the pass that looks
+        // only at marked slots, in place of everything below.
+        if crate::heap_pass::marked() {
+            self.heap_buffers_marked(list, heap, host, frame);
+            return Some(gpu);
+        }
+        // (`alt`, the marked pass's turn just over: the host copies it
+        // kept are let go.)
+        if crate::heap_pass::marked_paused() {
+            *MARKED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
         let started = std::time::Instant::now();
         // Per host heap: the host copy and range each slot's buffer view
         // reads, kept from pass to pass. Only the slots written since the
@@ -1579,9 +1607,6 @@ impl State {
         // at best); all of them every 16 passes, because a view of a
         // released resource goes stale without a write, and a slot written
         // before its memory had a host copy is only made then.
-        type Ranges = std::collections::HashMap<u32, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
-        static RANGES: std::sync::Mutex<Option<std::collections::HashMap<usize, (u64, Ranges)>>> =
-            std::sync::Mutex::new(None);
         let mut kept = RANGES.lock().unwrap_or_else(|e| e.into_inner());
         let (passes, ranges) = kept
             .get_or_insert_with(Default::default)
@@ -1698,6 +1723,159 @@ impl State {
             );
         }
         Some(gpu)
+    }
+
+    /// [`State::heap_buffers`]' pass with `VICTORY_HEAP_PASS_MARKED`
+    /// (`crate::heap_pass`, after fork pull request #523): a slot is looked
+    /// at again only when its view was written, the table entry its record
+    /// names was freed, its record in title memory is not the one seen at
+    /// its last look, or it found no host copy (every 16 passes); every slot
+    /// every 256 passes. A copy's span is worked out again only when one of
+    /// its slots went. What follows the slots (the refreshes, the textures,
+    /// the counts) is the other pass's, line for line.
+    fn heap_buffers_marked(
+        &self,
+        list: &HostList,
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        frame: u64,
+    ) {
+        let started = std::time::Instant::now();
+        let mut kept = MARKED.lock().unwrap_or_else(|e| e.into_inner());
+        let heaps = kept.get_or_insert_with(Default::default);
+        // `alt`, back from the other pass's turn: what is kept here is from
+        // before it, and it took the heap's changes meanwhile. Both start
+        // anew: this one now, the other at its next turn (with no entry it
+        // begins at pass 0, which looks at every slot).
+        if crate::heap_pass::RESUMED.swap(false, Ordering::Relaxed) {
+            heaps.clear();
+            *RANGES.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        // One list of freed table entries for all heaps: each heap's pass is told.
+        let forgotten = crate::descriptor::take_forgotten();
+        for picked in heaps.values_mut() {
+            picked.note_forgotten(forgotten.as_deref());
+        }
+        let ranges = heaps.entry(std::ptr::from_ref(host) as usize).or_insert_with(|| Marked::new(false));
+        let changed = host.buffer_changes();
+        let record = |index: u32| heap.handle(index).map(crate::descriptor::record_at);
+        let slots = ranges.plan(changed, || host.buffer_slots(), record, crate::descriptor::record_entry);
+        // Whether the device was there before the pass: a view that removes
+        // it is named below.
+        static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
+        HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        // Of the slots looked at, those whose record is the one seen at
+        // their last look (a view written again as it was).
+        let mut same = 0u64;
+        for (n, &index) in slots.iter().enumerate() {
+            let Some(handle) = heap.handle(index) else {
+                ranges.forget(index);
+                continue;
+            };
+            // Read before the slot is made: a write after it is seen next pass.
+            let record = crate::descriptor::record_at(handle);
+            let entry = crate::descriptor::record_entry(record);
+            same += u64::from(ranges.record_of(index) == Some(record));
+            ranges.forget(index);
+            let Some(view) = host.mirror(index, handle, true) else {
+                continue;
+            };
+            // Every 64 views while the device lives (a cheap query).
+            if alive
+                && n % 64 == 63
+                && let Some(why) = crate::descriptor::host::device_removed()
+            {
+                alive = false;
+                GONE.store(true, Ordering::Relaxed);
+                let last: Vec<String> = slots[n - 63..=n]
+                    .iter()
+                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                    .map(|s| s.chars().take(200).collect())
+                    .collect();
+                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                crate::host::log_removal_context();
+            }
+            // The copy the slot shows (`buffer_copy`), not the one the
+            // view's range alone would find.
+            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                // A buffer view whose memory has no host copy (yet): tried
+                // again every 16 passes. (Other views: left out until
+                // written, as in the other pass.)
+                if crate::descriptor::host::buffer_range(&view).is_some_and(|(_, len)| len > 0) {
+                    ranges.orphan(index, record, entry);
+                }
+                continue;
+            };
+            #[cfg(feature = "diagnostics")]
+            if host.shows(index, &shadow.buffer) == Some(false) {
+                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+            }
+            let key = std::sync::Arc::as_ptr(&shadow) as usize;
+            ranges.keep(index, key, &shadow, address, address + len, record, entry);
+        }
+        let views = ranges.views() as u32;
+        // Per host copy, the span its picked views cover.
+        let spans = ranges.spans();
+        drop(kept);
+        let bytes: u64 = spans.iter().map(|s| s.2 - s.1).sum();
+        // Memory that is not write-watched is copied whole by every refresh
+        // (see the other pass).
+        static WHOLE: std::sync::Mutex<Option<std::collections::HashMap<usize, u64>>> = std::sync::Mutex::new(None);
+        let mut whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
+        let whole = whole.get_or_insert_with(Default::default);
+        for (shadow, from, to) in &spans {
+            if shadow.unwatched() {
+                let key = shadow.id() as usize;
+                // `VICTORY_UNWATCHED_FRAMES` sets the interval (1: every frame).
+                static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let every = *EVERY.get_or_init(|| {
+                    std::env::var("VICTORY_UNWATCHED_FRAMES")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(1)
+                });
+                match whole.get(&key) {
+                    Some(&last) if frame < last + every => continue,
+                    _ => {
+                        whole.insert(key, frame);
+                    }
+                }
+            }
+            shadow.refresh(list, *from, *to - *from);
+        }
+        let textures_began = std::time::Instant::now();
+        self.heap_textures(list, heap, host);
+        HEAP_PASS_PARTS[0].fetch_add(textures_began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
+        HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        // Every 256 passes: how many of the slots looked at held the record
+        // of their last look (what a further cut could leave alone).
+        static SEEN: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+        SEEN[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
+        SEEN[2].fetch_add(same, Ordering::Relaxed);
+        if SEEN[0].fetch_add(1, Ordering::Relaxed) % 256 == 255 {
+            tracing::info!(
+                "the marked pass over the heap's buffer views (VICTORY_HEAP_PASS_MARKED), its last 256 passes: {} slots looked at, {} of them held the record seen at their last look; {} views kept now",
+                SEEN[1].swap(0, Ordering::Relaxed),
+                SEEN[2].swap(0, Ordering::Relaxed),
+                views,
+            );
+        }
+        static LOGGED: AtomicU64 = AtomicU64::new(0);
+        // The first pass and every growth of the set by half.
+        let seen = LOGGED.load(Ordering::Relaxed);
+        if u64::from(views) > seen + seen / 2 {
+            LOGGED.store(u64::from(views), Ordering::Relaxed);
+            tracing::info!(
+                slots = slots.len(),
+                views,
+                copies = spans.len(),
+                mb = bytes >> 20,
+                ms = started.elapsed().as_millis(),
+                "buffer views of the heap made ready for shaders that pick them by index (the marked pass)"
+            );
+        }
     }
 
     /// Runs the pass that uploads textures picked by index
