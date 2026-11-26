@@ -673,6 +673,21 @@ pub(crate) fn tables_line(frames: f64) {
          taken {keeps:.0} times, {kept_waits:.0} found it held and waited {kept_waited:.2} ms; the lock of the dynamic slots \
          (HostHeap::dynamic; its takes are the line above's tables asked): {next_waits:.0} found it held and waited {next_waited:.2} ms"
     );
+    let why: Vec<f64> =
+        crate::descriptor::host::DYNAMIC_WHY.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let low = crate::descriptor::host::DYNAMIC_LOW.swap(u32::MAX, Ordering::Relaxed);
+    let low = if low == u32::MAX { "no table asked".to_string() } else { format!("{low}") };
+    tracing::info!(
+        "dynamic slots per frame, tables refused by cause: {:.0} asked more slots than were free (the ring was full), {:.0} had room \
+         but a search for a table no longer had failed since the last release (not searched), {:.0} were searched for and no run of \
+         free slots was that long (the free slots lay apart); {:.0} tables got a run lying across the place the search starts from \
+         (missed by the search as it was before); the fewest free slots seen since the last line: {low} of {}",
+        why[0],
+        why[1],
+        why[2],
+        why[3],
+        crate::descriptor::host::DYNAMIC,
+    );
 }
 
 /// An experiment on the title's scissor rectangles (`VICTORY_SCISSOR_TEST=full`):
