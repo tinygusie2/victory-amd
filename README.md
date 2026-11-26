@@ -87,6 +87,13 @@ numbers are estimates until a run carries them.**
 - **Looked at for the card loss and not found to be the cause**: video memory. In four sessions
   the card was at 84 to 92 % of its budget throughout and never over it at a sample, the session
   with no loss as full as the others, and no out-of-memory result in any log. The cause is open.
+- **`VICTORY_BVH_NO_HIT=1`** (a translator change: the shader cache is rebuilt once after this
+  commit): the title's ray-traced passes run although nothing builds their structures, and each
+  node test read whatever bytes lay there. With the switch a node test answers "no hit" and reads
+  nothing, so every ray leaves at its first test and the answer is the same in every run. Not a
+  frame-rate change (those passes cost under 1 ms of card time a frame on the test machine).
+  Whether shadowed areas come out lit by the sky instead of black is not known until it runs.
+  Also pull request #1141 (`VICTORY_WAVE_WIDE=last`, opt-in).
 - `diagnostics/timing-run-295s-2026-11-25.txt`: a 295 s timing run with breadcrumbs.
 
 ### Before that (2026-11-25, night UTC)
