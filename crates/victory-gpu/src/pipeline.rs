@@ -749,6 +749,17 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::integer_targets_do_not_blend`).
+    #[cfg(windows)]
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
