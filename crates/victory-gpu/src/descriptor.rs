@@ -203,7 +203,14 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        // With `VICTORY_HEAP_SYNC_CUT`: only the pages that hold slots the
+        // host heap has title slots for are taken and read ([`sync_cut`]).
+        let looked_end = if sync_cut() {
+            (start as usize).saturating_add(mirrored_count as usize * step as usize).min(end as usize)
+        } else {
+            end as usize
+        };
+        for (range_from, range_end) in written.take(start as usize, looked_end) {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
@@ -215,7 +222,6 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    past_the_host(from, to, start as usize, step, (mirrored_count, heap.desc.count), &page_bytes, slots.end);
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
@@ -255,127 +261,46 @@ pub(crate) fn sync_heaps() {
     }
 }
 
-/// Since the start, of the title's view heaps ([`past_the_host`]): the
-/// highest title slot on a page the title changed, plus one; the records
-/// that are not all zeros the title wrote at slots the host heap has no
-/// title slot for (counted at every look, so a record is counted again
-/// when its page changes again); the highest such slot, plus one; and the
-/// host's count of title slots.
-pub(crate) static PAST_THE_HOST: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
-
-/// Of the records [`past_the_host`] counted, since the start, by what they
-/// name: a view object that is alive, a constant view held whole in the
-/// record, a view of placed memory, nothing the layer knows (a stale or
-/// foreign record). And, for the line every five seconds, those seen since
-/// the last such line ([`past_since`]).
-static PAST_KINDS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
-
-/// Records at slots the host heap has no title slot for that the title
-/// wrote since this was last asked (the frame line of [`sync_heaps`]).
-pub(crate) fn past_since() -> u64 {
-    PAST_KINDS[4].swap(0, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// An instrument, no change of what is mirrored: of the page `[from, to)`
-/// of a title view heap at `start` (records `step` bytes, `page` its
-/// bytes), notes how high the title's records reach, and the records it
-/// wrote at slots from `mirrored` on, which the host heap has no title
-/// slot for when the host caps the heap's size (the title's heap is
-/// `count` slots). Why it matters: the host slots from `mirrored` on are
-/// the per-draw tables', and a shader's view index is clamped only at the
-/// heap's last slot: a shader that picks a view by an index from
-/// `mirrored` on reads a slot that holds some draw's table, of whatever
-/// kind. Whether the title ever has views there was never measured (the
-/// highest slot seen was "about 720,000" when the split was chosen).
+/// Whether [`sync_heaps`] leaves alone the part of a title view heap the
+/// host heap has no title slots for (`VICTORY_HEAP_SYNC_CUT=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log).
+///
+/// On a host that caps view heaps at 1,000,000 the host heap holds the
+/// title's slots below 737,855 and the title's heap has 1,245,184. The
+/// records past the host's title slots were never mirrored
+/// ([`changed_slots`] cuts them off), but their pages were asked about and
+/// read all the same, and they are the busiest of the heap: the title
+/// keeps its own per-draw tables there and rewrites them every frame
+/// (measured in run 285 with an instrument since removed: about 100,000
+/// records a frame that are not zeros, a third of them live view objects,
+/// a fifth constant views; about half of the changed pages a frame). The
+/// layer serves those tables from slots of its own when a draw names
+/// them. With the switch the pass asks the write watch about, and reads,
+/// the mirrored part only: the same records are mirrored.
 #[cfg(windows)]
-fn past_the_host(from: usize, to: usize, start: usize, step: u64, (mirrored, count): (u32, u32), page: &[u8], highest_looked: u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    PAST_THE_HOST[3].store(u64::from(mirrored), Relaxed);
-    let before = PAST_THE_HOST[0].fetch_max(highest_looked, Relaxed);
-    if mirrored >= count {
-        return;
-    }
-    let step = step as usize;
-    let first = (from - start).div_ceil(step).max(mirrored as usize);
-    let last = ((to - start) / step).min(count as usize);
-    let (mut found, mut highest) = (0u64, 0u64);
-    let mut kinds = [0u64; 4];
-    let mut sample: Option<(usize, [u32; 3], usize)> = None;
-    for index in first..last {
-        let at = start + index * step - from;
-        let Some(record) = page.get(at..at + step) else {
-            continue;
-        };
-        if record.iter().all(|&b| b == 0) {
-            continue;
-        }
-        found += 1;
-        highest = index as u64 + 1;
-        // What the record names, as the mirror would read it (three words:
-        // a tag, an entry or part of an address, a generation and kind).
-        if let Some(words) = record.get(..12) {
-            let word = |k: usize| u32::from_le_bytes([words[4 * k], words[4 * k + 1], words[4 * k + 2], words[4 * k + 3]]);
-            let (i, generation) = (word(1), word(2));
-            let kind = match (generation >> KIND_SHIFT, view_at(i, generation)) {
-                (_, None) => 3,
-                (0, Some(_)) => 0,
-                (CONSTANT, Some(_)) => 1,
-                (_, Some(_)) => 2,
-            };
-            kinds[kind] += 1;
-            if kind != 3 && sample.is_none() {
-                sample = Some((index, [word(0), i, generation], kind));
+fn sync_cut() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_CUT").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "the pass over the title's view heap leaves the part the host has no title slots for alone from now                      (VICTORY_HEAP_SYNC_CUT=alt): {}",
+                    if on { "ON" } else { "off, every changed page is read as usual" }
+                );
             }
+            on
         }
-    }
-    for (count, n) in PAST_KINDS.iter().zip(kinds) {
-        count.fetch_add(n, Relaxed);
-    }
-    PAST_KINDS[4].fetch_add(found, Relaxed);
-    // A record that names a view the layer knows: said for the first 16.
-    if let Some((index, words, kind)) = sample {
-        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if SAID.fetch_add(1, Relaxed) < 16 {
-            tracing::warn!(
-                "a view record at title slot {index}, which the host heap has no title slot for, names {}: words {:#x} {:#x} {:#x}; \
-                 on this page: {} live view objects, {} constant views, {} views of placed memory, {} that name nothing known",
-                ["a live view object", "a constant view", "a view of placed memory"][kind],
-                words[0],
-                words[1],
-                words[2],
-                kinds[0],
-                kinds[1],
-                kinds[2],
-                kinds[3]
-            );
-        }
-    }
-    if found == 0 {
-        // Said as the title's records climb towards the host's last title slot.
-        if highest_looked > before && highest_looked / 16_384 != before / 16_384 {
-            tracing::info!(
-                "the title's view heap: the highest slot on a page it changed so far is {} (the host heap has title slots below {mirrored}; \
-                 the title's heap has {count})",
-                highest_looked.saturating_sub(1)
-            );
-        }
-        return;
-    }
-    let seen = PAST_THE_HOST[1].fetch_add(found, Relaxed);
-    let top = PAST_THE_HOST[2].fetch_max(highest, Relaxed);
-    if seen == 0 || highest > top {
-        tracing::warn!(
-            "the title wrote view records at slots the host heap has no title slot for: {found} on this page, the highest slot {} \
-             ({} such records seen so far: {} live view objects, {} constant views, {} views of placed memory, {} that name nothing \
-             known; the host heap has title slots below {mirrored}, and its slots from there to 999,998 hold per-draw tables: a \
-             shader that picks a view by one of these indices reads a table's slot, whatever it holds)",
-            highest - 1,
-            seen + found,
-            PAST_KINDS[0].load(Relaxed),
-            PAST_KINDS[1].load(Relaxed),
-            PAST_KINDS[2].load(Relaxed),
-            PAST_KINDS[3].load(Relaxed)
-        );
     }
 }
 
@@ -392,17 +317,6 @@ pub(crate) fn sync_line(frames: f64) {
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
-    }
-    let past = past_since();
-    if past > 0 {
-        tracing::warn!(
-            "view records the title wrote at slots the host heap has no title slot for, since the last such line: {past} \
-             (since the start by what they name: {} live view objects, {} constant views, {} views of placed memory, {} nothing known)",
-            PAST_KINDS[0].load(std::sync::atomic::Ordering::Relaxed),
-            PAST_KINDS[1].load(std::sync::atomic::Ordering::Relaxed),
-            PAST_KINDS[2].load(std::sync::atomic::Ordering::Relaxed),
-            PAST_KINDS[3].load(std::sync::atomic::Ordering::Relaxed)
-        );
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
