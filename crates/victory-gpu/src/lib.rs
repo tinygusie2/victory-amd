@@ -35,6 +35,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod fpsbox;
 #[cfg(windows)]
+mod stats;
+#[cfg(windows)]
 mod spread;
 #[cfg(windows)]
 mod draw;
